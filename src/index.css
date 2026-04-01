@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Opcional: Agrega un fondo oscuro global para que no parpadee en blanco al cargar */
+body {
+  background-color: #06090f;
+  color: #e2eaf5;
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+}
