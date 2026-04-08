@@ -20,8 +20,10 @@ import { useAuth } from '../context/AuthContext';
 /** Avatar: photo Base64 con fallback a iniciales generadas */
 const UserAvatar = memo(function UserAvatar({ user, size = 'md' }) {
   const sizeClasses = {
-    sm: 'w-7 h-7 text-[10px]',
-    md: 'w-8 h-8 text-xs',
+    sm:  'w-7  h-7  text-[10px]',
+    md:  'w-8  h-8  text-xs',
+    lg:  'w-16 h-16 text-lg',
+    xl:  'w-24 h-24 text-2xl',
   };
 
   const initials = user?.displayName
@@ -80,7 +82,7 @@ const DropdownItem = memo(function DropdownItem({ icon: Icon, label, onClick, va
 
 // ─── NavBar principal ─────────────────────────────────────────────────────────
 
-function NavBar({ onOpenSettings }) {
+function NavBar({ onOpenSettings, onNavigate }) {
   const { user, logout } = useAuth();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef(null);
@@ -102,6 +104,11 @@ function NavBar({ onOpenSettings }) {
     setDropdownOpen(false);
     logout();
   }, [logout]);
+
+  const handleProfile = useCallback(() => {
+    setDropdownOpen(false);
+    onNavigate?.('profile');
+  }, [onNavigate]);
 
   const handleSettings = useCallback(() => {
     setDropdownOpen(false);
@@ -186,7 +193,7 @@ function NavBar({ onOpenSettings }) {
               <DropdownItem
                 icon={User}
                 label="Mi perfil"
-                onClick={handleSettings}
+                onClick={handleProfile}
               />
               <DropdownItem
                 icon={Settings}

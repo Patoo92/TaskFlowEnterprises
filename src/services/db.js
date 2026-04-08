@@ -138,8 +138,11 @@ export const UserService = {
   },
 
   /**
-   * Actualiza displayName y/o photoURL (Base64).
-   * Filtra por uid para garantizar aislamiento.
+   * Actualiza displayName y/o photoURL.
+   * Si se recibe un photoURL (Base64 crudo), lo comprime antes de persistir:
+   * redimensiona a 400x400 max y codifica como JPEG 0.7 quality.
+   * Filtra por uid para aislamiento multitenant.
+   *
    * @param {string} uid
    * @param {{ displayName?: string, photoURL?: string }} updates
    * @returns {Promise<User>}
@@ -149,10 +152,16 @@ export const UserService = {
     const user = await db.get('users', uid);
     if (!user) throw new Error('USER_NOT_FOUND');
 
+    // Comprimir imagen si se está actualizando el avatar
+    let compressedPhoto = photoURL;
+    if (photoURL !== undefined && photoURL !== null) {
+      compressedPhoto = await compressImage(photoURL, 400, 400, 0.7);
+    }
+
     const updated = {
       ...user,
       ...(displayName !== undefined && { displayName: displayName.trim() }),
-      ...(photoURL !== undefined && { photoURL }),
+      ...(photoURL !== undefined && { photoURL: compressedPhoto }),
       updatedAt: now(),
     };
 
@@ -160,6 +169,68 @@ export const UserService = {
     return sanitizeUser(updated);
   },
 };
+
+// ─── Utilidad: compresión de imagen en cliente ────────────────────────────────
+
+/**
+ * Redimensiona y comprime una imagen Base64 usando HTMLCanvasElement.
+ * Opera completamente en el browser — cero dependencias externas.
+ *
+ * Algoritmo:
+ *  1. Decodifica el Base64 en un HTMLImageElement
+ *  2. Calcula las dimensiones de destino manteniendo aspect ratio
+ *  3. Dibuja en un OffscreenCanvas (o HTMLCanvasElement como fallback)
+ *  4. Exporta como JPEG con la calidad indicada
+ *
+ * @param {string}  base64     - Data URL completa ("data:image/...;base64,...")
+ * @param {number}  maxWidth   - Ancho máximo en px (default 400)
+ * @param {number}  maxHeight  - Alto máximo en px (default 400)
+ * @param {number}  quality    - Calidad JPEG 0-1 (default 0.7)
+ * @returns {Promise<string>}  Data URL JPEG comprimida
+ */
+async function compressImage(base64, maxWidth = 400, maxHeight = 400, quality = 0.7) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+
+    img.onload = () => {
+      // ── Calcular dimensiones respetando aspect ratio ──────────────────────
+      let { width, height } = img;
+      const ratio = Math.min(maxWidth / width, maxHeight / height);
+
+      // Solo reducir, nunca escalar hacia arriba
+      if (ratio < 1) {
+        width  = Math.round(width  * ratio);
+        height = Math.round(height * ratio);
+      }
+
+      // ── Dibujar en canvas ─────────────────────────────────────────────────
+      const canvas = document.createElement('canvas');
+      canvas.width  = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        // Si el contexto no está disponible (SSR/tests), devolver original
+        resolve(base64);
+        return;
+      }
+
+      // imageSmoothingQuality = 'high' activa el algoritmo bilinear en Chromium
+      ctx.imageSmoothingEnabled  = true;
+      ctx.imageSmoothingQuality  = 'high';
+      ctx.drawImage(img, 0, 0, width, height);
+
+      // ── Exportar como JPEG ────────────────────────────────────────────────
+      const compressed = canvas.toDataURL('image/jpeg', quality);
+      resolve(compressed);
+    };
+
+    img.onerror = () => reject(new Error('IMAGE_LOAD_ERROR'));
+
+    // Asignar src DESPUÉS de definir los handlers
+    img.src = base64;
+  });
+}
 
 // ─── Service: WorkspaceService ────────────────────────────────────────────────
 

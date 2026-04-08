@@ -28,6 +28,7 @@ import {
   Check,
   ChevronDown,
   DollarSign,
+  FileSpreadsheet,
   Loader2,
   Minus,
   Plus,
@@ -37,6 +38,7 @@ import {
   X,
 } from 'lucide-react';
 import { useWorkspace } from '../context/WorkspaceContext';
+import { exportSheetToExcel } from '../services/excelService';
 
 // ─── Helpers de formato ───────────────────────────────────────────────────────
 
@@ -478,6 +480,59 @@ const TaskItem = memo(function TaskItem({ task, sheetId, onToggle, onRemove }) {
   );
 });
 
+// ── ExportButton ──────────────────────────────────────────────────────────────
+
+/**
+ * Botón de exportación a Excel para la hoja activa.
+ * Estados: idle → exporting (spinner) → idle
+ * Errores capturados internamente para no romper el flujo del dashboard.
+ */
+const ExportButton = memo(function ExportButton({ sheet }) {
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = useCallback(async () => {
+    if (exporting || !sheet) return;
+    setExporting(true);
+    try {
+      await exportSheetToExcel(sheet);
+    } catch (err) {
+      console.error('[ExportButton] Error al exportar:', err.message);
+    } finally {
+      setExporting(false);
+    }
+  }, [sheet, exporting]);
+
+  return (
+    <button
+      onClick={handleExport}
+      disabled={exporting || !sheet}
+      title={exporting ? 'Exportando...' : 'Exportar hoja a Excel'}
+      className={`
+        flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+        border text-xs font-mono
+        transition-all duration-150
+        disabled:cursor-not-allowed
+        ${exporting
+          ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-400/60'
+          : 'border-white/[0.08] hover:border-emerald-500/30 bg-transparent hover:bg-emerald-500/5 text-white/40 hover:text-emerald-400'
+        }
+      `}
+    >
+      {exporting ? (
+        <>
+          <Loader2 size={12} className="animate-spin" />
+          <span>Exportando...</span>
+        </>
+      ) : (
+        <>
+          <FileSpreadsheet size={12} />
+          <span>Exportar Excel</span>
+        </>
+      )}
+    </button>
+  );
+});
+
 // ── Skeleton de carga ─────────────────────────────────────────────────────────
 
 const DashboardSkeleton = memo(function DashboardSkeleton() {
@@ -553,13 +608,19 @@ function Dashboard() {
       {activeSheet ? (
         <div className="flex-1 overflow-y-auto p-6">
           {/* Header de hoja */}
-          <div className="mb-6">
-            <h2 className="text-base font-mono font-bold text-white">
-              {activeSheet.name}
-            </h2>
-            <p className="text-[11px] font-mono text-white/25 mt-0.5">
-              Doble clic en la pestaña para renombrar · {activeSheet.tasks.length} tareas · {activeSheet.expenses.length} gastos
-            </p>
+          <div className="flex items-start justify-between gap-4 mb-6">
+            <div className="min-w-0">
+              <h2 className="text-base font-mono font-bold text-white truncate">
+                {activeSheet.name}
+              </h2>
+              <p className="text-[11px] font-mono text-white/25 mt-0.5">
+                Doble clic en la pestaña para renombrar · {activeSheet.tasks.length} tareas · {activeSheet.expenses.length} gastos
+              </p>
+            </div>
+            {/* Barra de herramientas de la hoja */}
+            <div className="flex items-center gap-2 shrink-0 pt-0.5">
+              <ExportButton sheet={activeSheet} />
+            </div>
           </div>
 
           {/* Grid bicolumna */}

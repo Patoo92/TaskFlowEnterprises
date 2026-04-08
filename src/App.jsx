@@ -1,47 +1,67 @@
 /**
  * @file App.jsx
- * @description Entry point de TaskFlow Enterprise.
+ * @description Entry point de TaskFlow Enterprise (Fase 3.2).
  *
- * Árbol de providers (de exterior a interior):
- *   GoogleOAuthProvider  ← requiere VITE_GOOGLE_CLIENT_ID en .env
- *     AuthProvider       ← sesión, login/register/google
+ * Router ligero sin react-router-dom — gestiona vistas con useState.
+ * Evita añadir una dependencia pesada para dos rutas simples.
+ *
+ * Vistas disponibles (estado autenticado):
+ *   'dashboard' → <Dashboard />  (default)
+ *   'profile'   → <ProfileScreen />
+ *
+ * Árbol de providers:
+ *   GoogleOAuthProvider
+ *     AuthProvider
  *       AuthRouter
- *         AppShell (si autenticado)
+ *         AppShell (autenticado)
  *           WorkspaceProvider
- *             NavBar + Dashboard
- *
- * GoogleOAuthProvider debe estar POR ENCIMA de AuthProvider porque
- * <GoogleLogin /> necesita acceder al contexto de Google OAuth.
+ *             NavBar  ← recibe onNavigate
+ *             <vista activa>
  */
 
-import { memo } from 'react';
+import { memo, useCallback, useState } from 'react';
 import { GoogleOAuthProvider } from '@react-oauth/google';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { WorkspaceProvider } from './context/WorkspaceContext';
-import LoginScreen from './screens/LoginScreen';
-import Dashboard from './screens/Dashboard';
-import NavBar from './components/NavBar';
+import LoginScreen    from './screens/LoginScreen';
+import Dashboard      from './screens/Dashboard';
+import ProfileScreen  from './screens/ProfileScreen';
+import NavBar         from './components/NavBar';
 
 // ─── Constante del Client ID ──────────────────────────────────────────────────
 
-/**
- * El CLIENT_ID se lee desde variables de entorno de Vite.
- * Crear un archivo `.env.local` en la raíz del proyecto con:
- *   VITE_GOOGLE_CLIENT_ID=tu_client_id_aqui.apps.googleusercontent.com
- *
- * NUNCA hacer commit de este archivo — añadirlo a .gitignore.
- */
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID ?? '';
+
+// ─── Vista válidas ────────────────────────────────────────────────────────────
+
+const VIEWS = /** @type {const} */ (['dashboard', 'profile']);
 
 // ─── App Shell ────────────────────────────────────────────────────────────────
 
 const AppShell = memo(function AppShell() {
+  const [view, setView] = useState('dashboard');
+
+  /**
+   * Cambia la vista activa. Solo acepta vistas registradas en VIEWS.
+   * @param {string} target
+   */
+  const navigate = useCallback((target) => {
+    if (VIEWS.includes(target)) setView(target);
+  }, []);
+
+  const goBack = useCallback(() => navigate('dashboard'), [navigate]);
+
   return (
     <WorkspaceProvider>
       <div className="min-h-screen bg-[#0d1117] text-white flex flex-col">
-        <NavBar />
+        {/* NavBar solo visible en dashboard — en profile tiene su propio header */}
+        {view === 'dashboard' && (
+          <NavBar onNavigate={navigate} />
+        )}
+
         <main className="flex-1 flex flex-col min-h-0">
-          <Dashboard />
+          {view === 'dashboard' && <Dashboard />}
+          {view === 'profile'   && <ProfileScreen onBack={goBack} />}
         </main>
       </div>
     </WorkspaceProvider>

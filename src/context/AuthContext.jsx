@@ -64,6 +64,15 @@ function authReducer(state, action) {
       return { status: 'unauthenticated', user: null, error: action.payload };
     case 'LOGOUT':
       return { status: 'unauthenticated', user: null, error: null };
+    // Optimistic: payload = { displayName?, photoURL? } — aplica inmediatamente en UI
+    case 'UPDATE_PROFILE':
+      return { ...state, user: { ...state.user, ...action.payload } };
+
+    // Rollback: restaura el user completo si la escritura en IDB falla
+    case 'ROLLBACK_PROFILE':
+      return { ...state, user: action.payload };
+
+    // Legacy alias — mantener compatibilidad
     case 'PROFILE_UPDATED':
       return { ...state, user: { ...state.user, ...action.payload } };
     case 'CLEAR_ERROR':
@@ -258,18 +267,45 @@ export function AuthProvider({ children }) {
     dispatch({ type: 'LOGOUT' });
   }, []);
 
-  // ── Actualización de perfil ─────────────────────────────────────────────────
+  // ── Actualización de perfil (Optimistic Update + Rollback) ──────────────────
+  //
+  // Flujo:
+  //  1. Guarda snapshot del user actual (para rollback)
+  //  2. Aplica UPDATE_PROFILE en React inmediatamente (UI no espera a IDB)
+  //  3. Intenta persistir en IndexedDB (compresión de imagen incluida en db.js)
+  //  4a. Éxito → refresca cookie con datos del DB (tiene el Base64 comprimido real)
+  //  4b. Fallo  → ROLLBACK_PROFILE restaura el snapshot y devuelve el error
+  //
   const updateProfile = useCallback(async (updates) => {
     if (!state.user?.uid) return { success: false, error: 'No autenticado.' };
+
+    // Snapshot para rollback
+    const previousUser = state.user;
+
+    // ── Optimistic update — React UI es inmediata ─────────────────────────
+    dispatch({ type: 'UPDATE_PROFILE', payload: updates });
+
     try {
-      const updatedUser = await UserService.updateProfile(state.user.uid, updates);
-      setSessionCookie(updatedUser);
-      dispatch({ type: 'PROFILE_UPDATED', payload: updates });
+      // db.js comprimirá el photoURL si está presente antes de escribir en IDB
+      const persistedUser = await UserService.updateProfile(state.user.uid, updates);
+
+      // Actualizar cookie con el Base64 comprimido real que devuelve la DB
+      setSessionCookie(persistedUser);
+
+      // Sincronizar estado React con los datos persistidos (puede diferir del
+      // optimistic si la compresión cambió el photoURL)
+      dispatch({ type: 'UPDATE_PROFILE', payload: {
+        displayName: persistedUser.displayName,
+        photoURL:    persistedUser.photoURL,
+      }});
+
       return { success: true };
     } catch (err) {
+      // ── Rollback — restaurar snapshot anterior ────────────────────────────
+      dispatch({ type: 'ROLLBACK_PROFILE', payload: previousUser });
       return { success: false, error: mapErrorMessage(err.message) };
     }
-  }, [state.user?.uid]);
+  }, [state.user]);
 
   const clearError = useCallback(() => dispatch({ type: 'CLEAR_ERROR' }), []);
 
