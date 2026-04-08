@@ -32,6 +32,7 @@ import { jwtDecode } from 'jwt-decode';
 import { UserService, SyncMetaService } from '../services/db';
 import { CloudService, isCloudConfigured } from '../services/cloudService';
 
+
 // ─── Configuración de cookies ─────────────────────────────────────────────────
 
 const SESSION_COOKIE = 'tf_session';
