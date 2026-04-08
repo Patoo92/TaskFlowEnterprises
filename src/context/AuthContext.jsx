@@ -154,6 +154,8 @@ function setSessionCookie(user) {
       email:       user.email,
       displayName: user.displayName,
       photoURL:    user.photoURL,
+      // Añadimos esto para que no se olvide tras recargar la página:
+      supabaseUid: user.supabaseUid || null,
     }),
     COOKIE_OPTIONS,
   );
