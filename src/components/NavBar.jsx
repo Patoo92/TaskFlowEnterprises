@@ -8,12 +8,18 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChevronDown,
+  Cloud,
+  CloudOff,
   LogOut,
+  RefreshCw,
   Settings,
   TrendingUp,
   User,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useWorkspace } from '../context/WorkspaceContext';
 
 // ─── Subcomponentes ───────────────────────────────────────────────────────────
 
@@ -82,8 +88,68 @@ const DropdownItem = memo(function DropdownItem({ icon: Icon, label, onClick, va
 
 // ─── NavBar principal ─────────────────────────────────────────────────────────
 
+// ── SyncIndicator ─────────────────────────────────────────────────────────────
+
+/**
+ * Indicador de estado de sincronización cloud.
+ * Muestra un ícono animado según syncStatus + tooltip con información.
+ * forceSync disponible via click para triggear sync manual.
+ */
+const SyncIndicator = memo(function SyncIndicator({ syncStatus, syncError, lastSyncedAt, onForceSync }) {
+  const config = {
+    idle: {
+      icon:    Cloud,
+      color:   'text-white/20 hover:text-white/50',
+      animate: false,
+      title:   lastSyncedAt
+        ? `Sincronizado · ${new Date(lastSyncedAt).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}`
+        : 'Sincronizado',
+    },
+    syncing: {
+      icon:    RefreshCw,
+      color:   'text-emerald-400',
+      animate: true,
+      title:   'Sincronizando...',
+    },
+    error: {
+      icon:    CloudOff,
+      color:   'text-red-400/70 hover:text-red-400',
+      animate: false,
+      title:   `Error de sync: ${syncError ?? 'desconocido'}`,
+    },
+    offline: {
+      icon:    WifiOff,
+      color:   'text-amber-400/60',
+      animate: false,
+      title:   'Sin conexión — cambios guardados localmente',
+    },
+  };
+
+  const { icon: Icon, color, animate, title } = config[syncStatus] ?? config.idle;
+
+  return (
+    <button
+      onClick={onForceSync}
+      title={title}
+      aria-label={title}
+      disabled={syncStatus === 'syncing' || syncStatus === 'offline'}
+      className={`
+        p-1.5 rounded-md transition-colors duration-150
+        disabled:cursor-default
+        ${color}
+      `}
+    >
+      <Icon
+        size={13}
+        className={animate ? 'animate-spin' : ''}
+      />
+    </button>
+  );
+});
+
 function NavBar({ onOpenSettings, onNavigate }) {
-  const { user, logout } = useAuth();
+  const { user, logout }                                     = useAuth();
+  const { syncStatus, syncError, lastSyncedAt, forceSync }   = useWorkspace();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef(null);
 
@@ -132,6 +198,12 @@ function NavBar({ onOpenSettings, onNavigate }) {
         <span className="hidden sm:block text-[10px] font-mono text-white/20 border border-white/[0.08] rounded px-1.5 py-0.5 tracking-widest uppercase">
           Enterprise
         </span>
+        <SyncIndicator
+          syncStatus={syncStatus}
+          syncError={syncError}
+          lastSyncedAt={lastSyncedAt}
+          onForceSync={forceSync}
+        />
       </div>
 
       {/* ── User Dropdown ───────────────────────────────────────────────── */}

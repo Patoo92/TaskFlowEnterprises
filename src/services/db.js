@@ -12,7 +12,7 @@ import { openDB } from 'idb';
 const DB_NAME = 'taskflow_enterprise';
 // v2: workspaces ahora almacena el array `sheets` embebido en el documento.
 // No se necesita un store adicional; las sheets viajan dentro del workspace.
-const DB_VERSION = 2;
+const DB_VERSION = 3;  // v3: adds sync_meta store for cloud sync metadata
 
 // ─── Inicialización ───────────────────────────────────────────────────────────
 
@@ -39,6 +39,14 @@ const dbPromise = openDB(DB_NAME, DB_VERSION, {
     // Si ya existía el store de workspaces (upgrade de v1→v2), no se recrea.
     // Los documentos existentes simplemente no tendrán `sheets`; se inicializan
     // con [] al leerlos por primera vez en `ensureDefault`.
+
+    // ── v3: Store sync_meta ───────────────────────────────────────────────────
+    // Metadatos de sincronización cloud por usuario.
+    // key: uid (local IDB uid)
+    // Separado de users para no contaminar el modelo de negocio con infra de sync.
+    if (oldVersion < 3 && !db.objectStoreNames.contains('sync_meta')) {
+      db.createObjectStore('sync_meta', { keyPath: 'uid' });
+    }
   },
 });
 
@@ -135,6 +143,23 @@ export const UserService = {
 
     await db.add('users', user);
     return sanitizeUser(user);
+  },
+
+  /**
+   * Vincula un Supabase UID al usuario local.
+   * Llamado tras el handshake auth con Supabase — persiste el UID para
+   * que WorkspaceContext pueda usarlo como owner_id en las consultas RLS.
+   * @param {string} uid         - UID local IDB
+   * @param {string} supabaseUid - UID de Supabase Auth
+   * @returns {Promise<User>}
+   */
+  async linkSupabase(uid, supabaseUid) {
+    const db = await dbPromise;
+    const user = await db.get('users', uid);
+    if (!user) throw new Error('USER_NOT_FOUND');
+    const updated = { ...user, supabaseUid, updatedAt: now() };
+    await db.put('users', updated);
+    return sanitizeUser(updated);
   },
 
   /**
@@ -359,6 +384,36 @@ export const WorkspaceService = {
     const ws = await db.get('workspaces', id);
     if (!ws || ws.ownerId !== ownerId) throw new Error('WORKSPACE_NOT_FOUND');
     await db.delete('workspaces', id);
+  },
+};
+
+// ─── Service: SyncMetaService ────────────────────────────────────────────────
+// Gestiona metadatos de sincronización cloud (lastSyncedAt, supabaseUid).
+// Completamente separado de la lógica de negocio.
+
+export const SyncMetaService = {
+  /**
+   * Lee los metadatos de sync del usuario.
+   * @param {string} uid - UID local IDB
+   * @returns {Promise<SyncMeta | null>}
+   */
+  async get(uid) {
+    const db = await dbPromise;
+    return db.get('sync_meta', uid) ?? null;
+  },
+
+  /**
+   * Crea o actualiza los metadatos de sync.
+   * @param {string} uid
+   * @param {{ supabaseUid?: string, lastSyncedAt?: string }} updates
+   * @returns {Promise<SyncMeta>}
+   */
+  async upsert(uid, updates) {
+    const db = await dbPromise;
+    const existing = await db.get('sync_meta', uid) ?? { uid };
+    const updated = { ...existing, ...updates };
+    await db.put('sync_meta', updated);
+    return updated;
   },
 };
 

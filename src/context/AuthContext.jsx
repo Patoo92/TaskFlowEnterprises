@@ -29,7 +29,8 @@ import {
 } from 'react';
 import Cookies from 'js-cookie';
 import { jwtDecode } from 'jwt-decode';
-import { UserService } from '../services/db';
+import { UserService, SyncMetaService } from '../services/db';
+import { CloudService, isCloudConfigured } from '../services/cloudService';
 
 // ─── Configuración de cookies ─────────────────────────────────────────────────
 
@@ -100,6 +101,7 @@ function mapErrorMessage(code) {
     VALIDATION_ERROR:      'Datos inválidos. Revisa los campos.',
     GOOGLE_DECODE_ERROR:   'No se pudo leer el token de Google. Inténtalo de nuevo.',
     GOOGLE_MISSING_FIELDS: 'Google no devolvió los datos necesarios (email o ID).',
+    SUPABASE_NOT_CONFIGURED: 'Sincronización cloud no configurada (local-only mode).',
   };
   return messages[code] ?? 'Ocurrió un error inesperado. Inténtalo de nuevo.';
 }
@@ -169,6 +171,42 @@ function clearSessionCookie() {
   Cookies.remove(SESSION_COOKIE);
 }
 
+// ─── Auth Bridge helpers ──────────────────────────────────────────────────────
+
+/**
+ * Intenta sincronizar la sesión con Supabase Auth en background.
+ * Falla silenciosamente si cloud no está configurado o hay error de red.
+ * Nunca bloquea el login local — el usuario accede aunque Supabase falle.
+ *
+ * @param {'manual'|'google'} method
+ * @param {{ email?: string, password?: string, idToken?: string }} credentials
+ * @param {string} localUid - UID de IDB del usuario
+ * @returns {Promise<string|null>} supabaseUid o null si falla
+ */
+async function syncSupabaseAuth(method, credentials, localUid) {
+  if (!isCloudConfigured()) return null;
+  try {
+    let supabaseUid;
+    if (method === 'google' && credentials.idToken) {
+      supabaseUid = await CloudService.bridgeGoogleAuth(credentials.idToken);
+    } else if (method === 'manual' && credentials.email && credentials.password) {
+      supabaseUid = await CloudService.bridgeManualAuth({
+        email:    credentials.email,
+        password: credentials.password,
+      });
+    }
+    if (supabaseUid) {
+      // Persistir el vínculo en IDB para rehidratación futura
+      await SyncMetaService.upsert(localUid, { supabaseUid });
+      return supabaseUid;
+    }
+  } catch (err) {
+    // Falla silenciosa — el usuario continúa en local-only mode
+    console.warn('[AuthContext] Supabase bridge failed (local-only mode):', err.message);
+  }
+  return null;
+}
+
 // ─── Provider ─────────────────────────────────────────────────────────────────
 
 export function AuthProvider({ children }) {
@@ -205,8 +243,15 @@ export function AuthProvider({ children }) {
     try {
       validateRegistration({ email, password, displayName });
       const user = await UserService.create({ email, password, displayName });
-      setSessionCookie(user);
-      dispatch({ type: 'AUTH_SUCCESS', payload: user });
+
+      // Auth bridge: background, falla silenciosa
+      const supabaseUid = await syncSupabaseAuth('manual', { email, password }, user.uid);
+      const finalUser   = supabaseUid
+        ? await UserService.linkSupabase(user.uid, supabaseUid)
+        : user;
+
+      setSessionCookie(finalUser);
+      dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
       return { success: true };
     } catch (err) {
       const message = mapErrorMessage(err.message);
@@ -221,8 +266,24 @@ export function AuthProvider({ children }) {
     try {
       validateLogin({ email, password });
       const user = await UserService.authenticate({ email, password });
-      setSessionCookie(user);
-      dispatch({ type: 'AUTH_SUCCESS', payload: user });
+
+      // Auth bridge + restore supabaseUid from sync_meta if already linked
+      let finalUser = user;
+      const meta = await SyncMetaService.get(user.uid);
+      if (meta?.supabaseUid) {
+        // Usuario ya vinculado — solo refrescar la sesión de Supabase
+        finalUser = { ...user, supabaseUid: meta.supabaseUid };
+        syncSupabaseAuth('manual', { email, password }, user.uid).catch(() => {});
+      } else {
+        // Primera vez — bridge en background
+        const supabaseUid = await syncSupabaseAuth('manual', { email, password }, user.uid);
+        if (supabaseUid) {
+          finalUser = await UserService.linkSupabase(user.uid, supabaseUid);
+        }
+      }
+
+      setSessionCookie(finalUser);
+      dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
       return { success: true };
     } catch (err) {
       const message = mapErrorMessage(err.message);
@@ -251,8 +312,18 @@ export function AuthProvider({ children }) {
       const profile = decodeGoogleCredential(credentialResponse.credential);
       const user    = await UserService.findOrCreateGoogle(profile);
 
-      setSessionCookie(user);
-      dispatch({ type: 'AUTH_SUCCESS', payload: user });
+      // Google bridge: usar el mismo idToken para signInWithIdToken en Supabase
+      const supabaseUid = await syncSupabaseAuth(
+        'google',
+        { idToken: credentialResponse.credential },
+        user.uid,
+      );
+      const finalUser = supabaseUid
+        ? await UserService.linkSupabase(user.uid, supabaseUid)
+        : user;
+
+      setSessionCookie(finalUser);
+      dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
       return { success: true };
     } catch (err) {
       const message = mapErrorMessage(err.message);
@@ -265,6 +336,10 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     clearSessionCookie();
     dispatch({ type: 'LOGOUT' });
+    // Limpiar sesión de Supabase en background (falla silenciosa)
+    if (isCloudConfigured()) {
+      CloudService.signOut().catch(() => {});
+    }
   }, []);
 
   // ── Actualización de perfil (Optimistic Update + Rollback) ──────────────────
@@ -316,6 +391,8 @@ export function AuthProvider({ children }) {
     error:           state.error,
     isAuthenticated: state.status === 'authenticated',
     isLoading:       state.status === 'loading' || state.status === 'idle',
+    // supabaseUid — disponible para WorkspaceContext (owner_id en RLS)
+    supabaseUid: state.user?.supabaseUid ?? null,
     register,
     login,
     loginWithGoogle,
