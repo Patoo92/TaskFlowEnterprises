@@ -193,7 +193,7 @@ async function syncSupabaseAuth(method, credentials, localUid) {
     if (method === 'google' && credentials.idToken) {
       supabaseUid = await CloudService.bridgeGoogleAuth(credentials.idToken);
     } else if (method === 'manual' && credentials.email && credentials.password) {
-      supabaseUid = await CloudService.bridgeManualAuth({
+      supabaseUid = await CloudService.syncSupabaseAuth({
         email:    credentials.email,
         password: credentials.password,
       });
@@ -218,24 +218,30 @@ export function AuthProvider({ children }) {
   // ── Rehidratación al montar ─────────────────────────────────────────────────
   useEffect(() => {
     async function rehydrate() {
-      dispatch({ type: 'LOADING' });
-      const session = getSessionCookie();
+  dispatch({ type: 'LOADING' });
+  const session = getSessionCookie();
 
-      if (!session?.uid) {
-        dispatch({ type: 'AUTH_FAILURE', payload: null });
-        return;
-      }
+  if (!session?.uid) {
+    dispatch({ type: 'AUTH_FAILURE', payload: null });
+    return;
+  }
 
-      try {
-        // Revalida uid en IDB — defensa ante cookies con datos stale
-        const user = await UserService.getById(session.uid);
-        setSessionCookie(user); // renueva expiración en cada visita
-        dispatch({ type: 'AUTH_SUCCESS', payload: user });
-      } catch (err) {
-        clearSessionCookie();
-        dispatch({ type: 'AUTH_FAILURE', payload: mapErrorMessage(err.message) });
-      }
-    }
+  try {
+    const idbUser = await UserService.getById(session.uid);
+    
+    // Rescate crítico del UID de Supabase (Solución al "F5 de la Muerte")
+    const finalUser = {
+      ...idbUser,
+      supabaseUid: idbUser.supabaseUid || session.supabaseUid || null,
+    };
+
+    setSessionCookie(finalUser); 
+    dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
+  } catch (err) {
+    clearSessionCookie();
+    dispatch({ type: 'AUTH_FAILURE', payload: mapErrorMessage(err.message) });
+  }
+}
 
     rehydrate();
   }, []);
@@ -366,7 +372,7 @@ export function AuthProvider({ children }) {
     try {
       // db.js comprimirá el photoURL si está presente antes de escribir en IDB
       const persistedUser = await UserService.updateProfile(state.user.uid, updates);
-
+      persistedUser.supabaseUid = supabaseUid; // <--- AGREGÁ ESTA LÍNEA
       // Actualizar cookie con el Base64 comprimido real que devuelve la DB
       setSessionCookie(persistedUser);
 
