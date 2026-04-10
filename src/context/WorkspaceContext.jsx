@@ -1,50 +1,65 @@
 /**
  * @file WorkspaceContext.jsx
- * @description Contexto global de hojas de trabajo — Fase 4: Cloud Sync Engine.
- * @version 1.0.1 — Refactorización de reducer y mejoras de mantenibilidad
+ * @description Contexto global de hojas de trabajo — Fase 5: Outbox Pattern + Delta Sync.
+ * @version 1.5.0
  *
- * ── Arquitectura de persistencia ─────────────────────────────────────────────
+ * ── Arquitectura de persistencia v1.5 ────────────────────────────────────────
  *
  *  User Action
  *      │
  *      ▼
- *  dispatch()        ← React state (L1, inmediato, nunca bloquea)
+ *  dispatch()            ← React state (L1, inmediato)
  *      │
  *      ▼
- *  IDB write         ← debounced 600ms (L2, local-first source of truth)
+ *  IDB write (atomic)    ← Store normalizado correcto (L2, local-first)
  *      │
  *      ▼
- *  Sync Queue        ← Set de workspaceIds pendientes de push
+ *  OutboxService.enqueue ← Mutación atómica en store 'outbox' (L3, durable)
  *      │
  *      ▼
- *  CloudService      ← background push a Supabase (con retry exponencial)
+ *  drainOutbox()         ← CloudService.processOutboxBatch (orden topológico)
+ *      │
+ *      ▼
+ *  Supabase RPC          ← batch_sync_workspace (transacción atómica)
  *
- * ── Patrones implementados ────────────────────────────────────────────────────
+ * ── Cambios v1.5.0 ────────────────────────────────────────────────────────────
  *
- *  Write-Behind Cache:
- *    Las escrituras locales son síncronas; el push a Supabase es asíncrono
- *    y se ejecuta en background sin bloquear la UI.
+ *  [CTX-01] Outbox durable: syncQueueRef reemplazado por OutboxService.
+ *    Cada mutación se persiste en IDB antes de intentar el sync cloud.
+ *    Si la app se cierra antes del sync, el outbox se drena al siguiente inicio.
  *
- *  Sync Queue (Map<workspaceId, WorkspaceSnapshot>):
- *    Cada acción de usuario añade un snapshot al Map. El drain lee
- *    desde `latestStateRef` para garantizar que siempre se sube el
- *    estado más reciente, evitando race conditions con stale closures.
+ *  [CTX-02] Operaciones IDB granulares:
+ *    Ya no se llama a WorkspaceService.saveSheets() (full snapshot).
+ *    Cada acción escribe solo en el store específico:
+ *      addTask → TaskService.create
+ *      toggleTask → TaskService.toggle
+ *      removeTask → TaskService.softDelete
+ *      addExpense → ExpenseService.create
+ *      removeExpense → ExpenseService.softDelete
+ *      addSheet → SheetService.create
+ *      renameSheet → SheetService.update
+ *      setCapital → SheetService.update
+ *      removeSheet → SheetService.softDelete
  *
- *  Reconciliation on Reconnect:
- *    Al recuperar conectividad, fetch delta (since lastSyncedAt).
- *    Remote wins si remote.updated_at > local.workspaceUpdatedAt.
- *    REMOTE_MERGE actualiza React state + IDB sin re-encolar para cloud.
+ *  [CTX-03] drainOutbox con orden topológico garantizado:
+ *    OutboxService.getAll() devuelve mutaciones ordenadas por MUTATION_TOPO_ORDER.
+ *    Esto evita FK violations al insertar hijos antes que padres.
  *
- *  Network Resiliency:
- *    navigator.onLine + 'online'/'offline' events.
- *    syncStatus: 'idle' | 'syncing' | 'error' | 'offline'
- *    forceSync() expuesto para triggers manuales desde UI.
+ *  [CTX-04] Reconciliación LWW (Last Write Wins) con datos normalizados:
+ *    La reconciliación recibe el delta normalizado de fetch_workspace_delta
+ *    y aplica upsert entity-by-entity en IDB, comparando updated_at.
+ *    Remote gana solo si remote.updated_at > local.updated_at.
  *
- * ── Cambios v1.0.1 ────────────────────────────────────────────────────────────
- *  [OPT-02] Helper interno `updateSheet` elimina el patrón
- *           `state.sheets.map(s => s.id === id ? {...s} : s)` repetido 7 veces.
- *           El reducer pasa de ~130 líneas a ~85, reduciendo la complejidad
- *           ciclomática de 17 a 10 paths independientes.
+ *  [CTX-05] Carga inicial desde stores normalizados:
+ *    WorkspaceService.ensureDefault() carga y migra datos legacy si existen.
+ *    El estado React se construye desde WorkspaceView (join en IDB).
+ *
+ *  ── INTACTO ────────────────────────────────────────────────────────────────
+ *  ✓ Estructura del reducer (wsReducer) con helper updateSheet
+ *  ✓ Patrón latestStateRef / userRef para evitar stale closures
+ *  ✓ Lógica de red (online/offline events)
+ *  ✓ forceSync expuesto en contexto
+ *  ✓ API pública del contexto (mismas props que v1.0.x para compatibilidad UI)
  */
 
 import {
@@ -57,69 +72,63 @@ import {
   useRef,
   useState,
 } from 'react';
-import { useAuth } from './AuthContext';
-import { WorkspaceService, SyncMetaService, makeExpense, makeSheet, makeTask } from '../services/db';
-import { CloudService, isCloudConfigured } from '../services/cloudService';
+import { useAuth }  from './AuthContext';
+import {
+  WorkspaceService,
+  SheetService,
+  TaskService,
+  ExpenseService,
+  OutboxService,
+  SyncMetaService,
+  MutationType,
+  MUTATION_TOPO_ORDER,
+  makeSheet,
+  makeTask,
+  makeExpense,
+} from '../services/db';
+import { CloudService, isCloudConfigured, MAX_OUTBOX_RETRIES } from '../services/cloudService';
 
 // ─── Estado inicial ───────────────────────────────────────────────────────────
 
 const initialState = {
-  status:             'idle',   // 'idle' | 'loading' | 'ready' | 'error'
+  status:             'idle',    // 'idle' | 'loading' | 'ready' | 'error'
   workspaceId:        null,
   workspaceName:      'Mi Workspace',
-  workspaceUpdatedAt: null,     // ISO — para comparar con remote.updated_at
-  sheets:             [],
+  sheets:             [],        // SheetView[] — incluye tasks[] y expenses[] anidados
   activeSheetId:      null,
   error:              null,
-  // ── Sync state ────────────────────────────────────────────────────────────
-  syncStatus:         'idle',   // 'idle' | 'syncing' | 'error' | 'offline'
+  // ── Sync ────────────────────────────────────────────────────────────────
+  syncStatus:         'idle',    // 'idle' | 'syncing' | 'error' | 'offline'
   syncError:          null,
-  lastSyncedAt:       null,     // ISO del último sync exitoso
+  lastSyncedAt:       null,
+  pendingMutations:   0,         // badge para NavBar
 };
 
-// ─── Helper interno del Reducer ───────────────────────────────────────────────
+// ─── Helper: actualizador inmutable de sheet ──────────────────────────────────
 
-/**
- * Aplica `updater` a la sheet cuyo `id === sheetId` y deja el resto intacto.
- *
- * [OPT-02] Centraliza el patrón `sheets.map(s => s.id === id ? updater(s) : s)`
- * que antes se repetía en 7 cases del reducer (SET_CAPITAL, ADD_EXPENSE,
- * REMOVE_EXPENSE, ADD_TASK, TOGGLE_TASK, REMOVE_TASK, RENAME_SHEET).
- * Cada case ahora es una sola llamada declarativa, eliminando el ruido visual
- * y reduciendo la superficie de error en futuros cambios.
- *
- * Complejidad: O(n) donde n = número de sheets (generalmente 1-10).
- *
- * @param {Sheet[]} sheets   - Array actual de sheets del estado
- * @param {string}  sheetId  - ID de la sheet a modificar
- * @param {function(Sheet): Sheet} updater - Función pura que recibe la sheet y devuelve la nueva
- * @returns {Sheet[]}         - Nuevo array (inmutable — no muta el original)
- */
 function updateSheet(sheets, sheetId, updater) {
   return sheets.map((s) => (s.id === sheetId ? updater(s) : s));
 }
 
-// ─── Reducer ──────────────────────────────────────────────────────────────────
+// ─── Reducer ─────────────────────────────────────────────────────────────────
 
 function wsReducer(state, action) {
   switch (action.type) {
 
-    // ── Ciclo de carga ──────────────────────────────────────────────────────
     case 'LOADING':
       return { ...state, status: 'loading', error: null };
 
     case 'INIT_SUCCESS': {
-      const { workspaceId, workspaceName, workspaceUpdatedAt, sheets, lastSyncedAt } = action.payload;
+      const { workspaceId, workspaceName, sheets, lastSyncedAt } = action.payload;
       return {
         ...state,
-        status:             'ready',
+        status:        'ready',
         workspaceId,
-        workspaceName:      workspaceName ?? 'Mi Workspace',
-        workspaceUpdatedAt: workspaceUpdatedAt ?? null,
+        workspaceName: workspaceName ?? 'Mi Workspace',
         sheets,
-        activeSheetId:      sheets[0]?.id ?? null,
-        error:              null,
-        lastSyncedAt:       lastSyncedAt ?? null,
+        activeSheetId: sheets[0]?.id ?? null,
+        error:         null,
+        lastSyncedAt:  lastSyncedAt ?? null,
       };
     }
 
@@ -129,7 +138,7 @@ function wsReducer(state, action) {
     case 'RESET':
       return initialState;
 
-    // ── Sync state ──────────────────────────────────────────────────────────
+    // ── Sync ────────────────────────────────────────────────────────────────
     case 'SYNC_STATUS':
       return {
         ...state,
@@ -138,28 +147,36 @@ function wsReducer(state, action) {
       };
 
     case 'SET_LAST_SYNCED':
-      return { ...state, lastSyncedAt: action.payload, syncStatus: 'idle', syncError: null };
+      return {
+        ...state,
+        lastSyncedAt:     action.payload,
+        syncStatus:       'idle',
+        syncError:        null,
+        pendingMutations: 0,
+      };
+
+    case 'SET_PENDING_MUTATIONS':
+      return { ...state, pendingMutations: action.payload };
 
     /**
-     * REMOTE_MERGE: integra datos remotos más recientes.
-     * Solo actualiza sheets (y nombre si cambió).
-     * NO incrementa syncTick → no re-encola para cloud push (evita loop).
+     * REMOTE_MERGE: integra entidades remotas más recientes.
+     * NO re-encola al cloud — solo actualiza React state.
+     * El caller ya persistió en IDB antes de dispatchar.
      */
     case 'REMOTE_MERGE':
       return {
         ...state,
-        sheets:             action.payload.sheets,
-        workspaceName:      action.payload.name ?? state.workspaceName,
-        workspaceUpdatedAt: action.payload.updatedAt ?? state.workspaceUpdatedAt,
+        sheets:        action.payload.sheets,
+        workspaceName: action.payload.workspaceName ?? state.workspaceName,
       };
 
-    // ── Navegación de tabs ──────────────────────────────────────────────────
+    // ── Navegación ──────────────────────────────────────────────────────────
     case 'SET_ACTIVE_SHEET':
       return { ...state, activeSheetId: action.payload };
 
-    // ── CRUD de Sheets ──────────────────────────────────────────────────────
+    // ── CRUD Sheets ─────────────────────────────────────────────────────────
     case 'ADD_SHEET': {
-      const sheet = makeSheet(action.payload);
+      const sheet = action.payload; // SheetView completo creado por IDB
       return {
         ...state,
         sheets:        [...state.sheets, sheet],
@@ -170,10 +187,8 @@ function wsReducer(state, action) {
     case 'RENAME_SHEET':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          name: action.payload.name,
+          ...s, name: action.payload.name,
         })),
       };
 
@@ -181,11 +196,10 @@ function wsReducer(state, action) {
       const next = state.sheets.filter((s) => s.id !== action.payload);
       return {
         ...state,
-        sheets: next,
-        activeSheetId:
-          state.activeSheetId === action.payload
-            ? (next[0]?.id ?? null)
-            : state.activeSheetId,
+        sheets:        next,
+        activeSheetId: state.activeSheetId === action.payload
+          ? (next[0]?.id ?? null)
+          : state.activeSheetId,
       };
     }
 
@@ -193,30 +207,24 @@ function wsReducer(state, action) {
     case 'SET_CAPITAL':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          capital: action.payload.capital,
+          ...s, capital: action.payload.capital,
         })),
       };
 
     case 'ADD_EXPENSE':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          expenses: [...s.expenses, makeExpense(action.payload.expense)],
+          ...s, expenses: [...s.expenses, action.payload.expense],
         })),
       };
 
     case 'REMOVE_EXPENSE':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          expenses: s.expenses.filter((e) => e.id !== action.payload.expenseId),
+          ...s, expenses: s.expenses.filter((e) => e.id !== action.payload.expenseId),
         })),
       };
 
@@ -224,23 +232,18 @@ function wsReducer(state, action) {
     case 'ADD_TASK':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          tasks: [...s.tasks, makeTask(action.payload.text)],
+          ...s, tasks: [...s.tasks, action.payload.task],
         })),
       };
 
     case 'TOGGLE_TASK':
       return {
         ...state,
-        // [OPT-02] updateSheet anida el toggle de tarea en una sola expresión legible
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
           ...s,
           tasks: s.tasks.map((t) =>
-            t.id === action.payload.taskId
-              ? { ...t, completed: !t.completed }
-              : t,
+            t.id === action.payload.taskId ? { ...t, completed: !t.completed } : t,
           ),
         })),
       };
@@ -248,10 +251,8 @@ function wsReducer(state, action) {
     case 'REMOVE_TASK':
       return {
         ...state,
-        // [OPT-02] updateSheet reemplaza el .map() inline de 5 líneas
         sheets: updateSheet(state.sheets, action.payload.sheetId, (s) => ({
-          ...s,
-          tasks: s.tasks.filter((t) => t.id !== action.payload.taskId),
+          ...s, tasks: s.tasks.filter((t) => t.id !== action.payload.taskId),
         })),
       };
 
@@ -268,52 +269,22 @@ const WorkspaceContext = createContext(null);
 
 export function WorkspaceProvider({ children }) {
   const { user, isAuthenticated } = useAuth();
-  const [state, dispatch] = useReducer(wsReducer, initialState);
+  const [state, dispatch]         = useReducer(wsReducer, initialState);
 
-  // ── Refs ────────────────────────────────────────────────────────────────────
+  // ── Refs (evitan stale closures en callbacks async) ─────────────────────────
+  const latestStateRef   = useRef(state);
+  const userRef          = useRef(user);
+  const isSyncingRef     = useRef(false);    // mutex drain
+  const initialized      = useRef(false);
 
-  // Siempre apunta al estado React más reciente — evita stale closures en async callbacks
-  const latestStateRef = useRef(state);
   useEffect(() => { latestStateRef.current = state; });
-
-  // Ref al user para evitar cerrar sobre el estado del efecto
-  const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
 
-  // Write-behind queue: Map<workspaceId, true> — solo necesitamos el ID
-  // Se usa Map en lugar de Set para extensibilidad futura (multi-workspace)
-  const syncQueueRef = useRef(new Map());
-
-  // Mutex — evita ejecuciones concurrentes del drain
-  const isSyncingRef = useRef(false);
-
-  // Ref para el timer de debounce de IDB
-  const persistTimerRef = useRef(null);
-
-  // Flag de inicialización — evita re-fetch en re-renders de AuthContext
-  const initialized = useRef(false);
-
-  // ── syncTick: dispara el drainQueue effect ──────────────────────────────────
-  // Es un contador, no datos. Cambiarlo re-ejecuta el drain sin incluirlo en deps.
+  // syncTick: entero que incrementa cuando el outbox recibe una nueva entrada.
+  // El efecto que lo observa dispara drainOutbox sin incluirlo en deps circulares.
   const [syncTick, setSyncTick] = useState(0);
 
-  // ─── Helpers de enqueueing ──────────────────────────────────────────────────
-
-  /**
-   * Añade el workspace activo a la sync queue y dispara el drain.
-   * Llamado desde cada acción que muta datos locales.
-   * NO-OP si cloud no está configurado o el usuario no tiene supabaseUid.
-   */
-  const enqueue = useCallback(() => {
-    const currentState = latestStateRef.current;
-    const currentUser  = userRef.current;
-    if (!currentState.workspaceId || !currentUser?.supabaseUid) return;
-    if (!isCloudConfigured()) return;
-    syncQueueRef.current.set(currentState.workspaceId, true);
-    setSyncTick((t) => t + 1);
-  }, []);
-
-  // ─── IDB: Carga inicial ─────────────────────────────────────────────────────
+  // ─── Carga inicial ──────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!isAuthenticated || !user?.uid) {
@@ -326,19 +297,27 @@ export function WorkspaceProvider({ children }) {
     async function init() {
       dispatch({ type: 'LOADING' });
       try {
-        const ws   = await WorkspaceService.ensureDefault(user.uid);
-        const meta = await SyncMetaService.get(user.uid);
+        // ensureDefault migra datos legacy si existen y devuelve WorkspaceView
+        const wsView = await WorkspaceService.ensureDefault(user.uid);
+        const meta   = await SyncMetaService.get(user.uid);
 
         dispatch({
           type:    'INIT_SUCCESS',
           payload: {
-            workspaceId:        ws.id,
-            workspaceName:      ws.name,
-            workspaceUpdatedAt: ws.updatedAt ?? null,
-            sheets:             ws.sheets,
-            lastSyncedAt:       meta?.lastSyncedAt ?? null,
+            workspaceId:   wsView.id,
+            workspaceName: wsView.name,
+            sheets:        wsView.sheets,    // SheetView[] ya con tasks/expenses
+            lastSyncedAt:  meta?.lastSyncedAt ?? null,
           },
         });
+
+        // Drenar outbox residual de sesiones anteriores (mutaciones offline)
+        const pending = await OutboxService.count();
+        if (pending > 0) {
+          dispatch({ type: 'SET_PENDING_MUTATIONS', payload: pending });
+          setSyncTick((t) => t + 1);
+        }
+
         initialized.current = true;
       } catch (err) {
         dispatch({ type: 'SET_ERROR', payload: err.message });
@@ -348,37 +327,23 @@ export function WorkspaceProvider({ children }) {
     init();
   }, [isAuthenticated, user?.uid]);
 
-  // ─── IDB: Write-Behind debounced 600ms ─────────────────────────────────────
-
-  useEffect(() => {
-    if (state.status !== 'ready' || !state.workspaceId || !user?.uid) return;
-
-    clearTimeout(persistTimerRef.current);
-    persistTimerRef.current = setTimeout(async () => {
-      try {
-        await WorkspaceService.saveSheets(state.workspaceId, user.uid, state.sheets);
-      } catch (err) {
-        console.error('[WorkspaceContext] IDB write error:', err.message);
-      }
-    }, 600);
-
-    return () => clearTimeout(persistTimerRef.current);
-  }, [state.sheets, state.workspaceId, state.status, user?.uid]);
-
-  // ─── Cloud: Drain Queue ─────────────────────────────────────────────────────
+  // ─── Drain del outbox (Sync Engine) ────────────────────────────────────────
 
   /**
-   * Procesa la sync queue: empuja cada workspace pendiente a Supabase.
+   * Procesa todas las mutaciones pendientes del outbox en orden topológico.
    *
-   * Garantías de atomicidad:
-   *  - Fallo en cloud push → el workspace PERMANECE en la queue (retry en el próximo tick)
-   *  - IDB ya tiene los datos — la escritura cloud nunca afecta el estado local
-   *  - isSyncingRef previene ejecuciones solapadas
+   * Garantías:
+   *  1. isSyncingRef = mutex — nunca dos drains concurrentes.
+   *  2. Cada entrada se elimina del outbox solo tras confirmación de Supabase.
+   *  3. Fallo en batch → el batch completo permanece en outbox para retry.
+   *  4. Entradas con retries >= MAX_OUTBOX_RETRIES se descartan (datos inválidos).
+   *  5. Orden topológico: UPSERT_WORKSPACE → UPSERT_SHEET → UPSERT_TASK/EXPENSE
+   *                       → DELETE_EXPENSE → DELETE_TASK → DELETE_SHEET
+   *     Esto garantiza que el padre existe en Supabase antes de insertar el hijo.
    */
-  const drainQueue = useCallback(async () => {
-    if (isSyncingRef.current) return;
-    if (syncQueueRef.current.size === 0) return;
-    if (!isCloudConfigured()) return;
+  const drainOutbox = useCallback(async () => {
+    if (isSyncingRef.current)   return;
+    if (!isCloudConfigured())   return;
 
     const currentUser = userRef.current;
     if (!currentUser?.supabaseUid) return;
@@ -388,54 +353,99 @@ export function WorkspaceProvider({ children }) {
       return;
     }
 
+    const mutations = await OutboxService.getAll();
+    if (!mutations.length) return;
+
     isSyncingRef.current = true;
     dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
 
     try {
-      for (const [wsId] of syncQueueRef.current) {
-        const { sheets, workspaceName } = latestStateRef.current;
+      // Filtrar entradas con demasiados reintentos
+      const valid    = mutations.filter((m) => (m.retries ?? 0) < MAX_OUTBOX_RETRIES);
+      const invalid  = mutations.filter((m) => (m.retries ?? 0) >= MAX_OUTBOX_RETRIES);
 
-        await CloudService.upsertWorkspace(
-          { id: wsId, name: workspaceName, sheets },
-          currentUser.supabaseUid,
-        );
-
-        // Solo eliminar del queue si el push fue exitoso
-        syncQueueRef.current.delete(wsId);
+      // Descartar entradas irrecuperables (datos corruptos o schema incompatible)
+      for (const m of invalid) {
+        console.warn('[WorkspaceContext] Descartando mutación con max reintentos:', m.id);
+        await OutboxService.remove(m.id);
       }
 
-      const now = new Date().toISOString();
-      await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: now });
-      dispatch({ type: 'SET_LAST_SYNCED', payload: now });
+      if (!valid.length) {
+        dispatch({ type: 'SET_LAST_SYNCED', payload: new Date().toISOString() });
+        return;
+      }
+
+      // Enviar el batch al RPC (transacción atómica en Supabase)
+      const result = await CloudService.processOutboxBatch(valid, currentUser.supabaseUid);
+
+      if (result.success) {
+        // Confirmar: eliminar entradas del outbox
+        for (const m of valid) await OutboxService.remove(m.id);
+
+        // Purgar tombstones de IDB que ya fueron confirmados por Supabase
+        const deletedTaskIds    = valid.filter((m) => m.type === MutationType.DELETE_TASK)
+                                       .map((m) => m.payload.id);
+        const deletedExpenseIds = valid.filter((m) => m.type === MutationType.DELETE_EXPENSE)
+                                       .map((m) => m.payload.id);
+
+        if (deletedTaskIds.length)    await TaskService.purgeTombstones(deletedTaskIds);
+        if (deletedExpenseIds.length) await ExpenseService.purgeTombstones(deletedExpenseIds);
+
+        // Actualizar metadatos de sync
+        const nowIso = new Date().toISOString();
+        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
+        dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
+
+      } else {
+        // Incrementar reintentos para todas las entradas fallidas
+        for (const m of valid) await OutboxService.incrementRetry(m.id);
+        dispatch({ type: 'SYNC_STATUS', payload: { status: 'error', error: result.error } });
+      }
 
     } catch (err) {
-      // El workspace permanece en la queue — se reintentará en el próximo tick
-      console.error('[WorkspaceContext] Cloud push error:', err.message);
+      console.error('[WorkspaceContext] drainOutbox error:', err.message);
+      // Incrementar reintentos de todo el batch (el RPC falló, no datos individuales)
+      const mutations2 = await OutboxService.getAll();
+      for (const m of mutations2) await OutboxService.incrementRetry(m.id);
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'error', error: err.message } });
     } finally {
       isSyncingRef.current = false;
+      // Actualizar badge de pendientes
+      const remaining = await OutboxService.count();
+      dispatch({ type: 'SET_PENDING_MUTATIONS', payload: remaining });
     }
   }, []);
 
-  // Drain se ejecuta cada vez que syncTick cambia (enqueue lo incrementa)
+  // Ejecutar drain cuando syncTick cambia (acción de usuario) o al recuperar red
   useEffect(() => {
     if (syncTick === 0) return;
-    drainQueue();
-  }, [syncTick, drainQueue]);
+    drainOutbox();
+  }, [syncTick, drainOutbox]);
 
-  // ─── Network Resiliency: online / offline events ───────────────────────────
+  // ─── Helper: encolar mutación y disparar sync ───────────────────────────────
 
   /**
-   * Reconcilia datos locales con Supabase al recuperar conectividad.
+   * Persiste una mutación en el outbox durable e incrementa syncTick.
+   * NO-OP si cloud no está configurado o el usuario no tiene supabaseUid.
+   * @param {{ type: string, payload: object }} mutation
+   */
+  const enqueue = useCallback(async (mutation) => {
+    const currentUser  = userRef.current;
+    if (!isCloudConfigured() || !currentUser?.supabaseUid) return;
+    await OutboxService.enqueue(mutation);
+    setSyncTick((t) => t + 1);
+  }, []);
+
+  // ─── Reconciliación LWW (Last Write Wins) ──────────────────────────────────
+
+  /**
+   * Descarga el delta de Supabase y lo fusiona con el estado local.
    *
-   * Estrategia de resolución de conflictos (Last-Write-Wins por timestamp):
-   *  - Remote updated_at > local workspaceUpdatedAt → REMOTE_MERGE (remote gana)
-   *  - Local más reciente → el queue ya lo tiene → se sube al reconectar
-   *  - Sin datos remotos en el delta → nada que hacer
+   * Estrategia LWW por entidad:
+   *   - Si remote.updated_at > local.updated_at → Supabase gana, se actualiza IDB
+   *   - Si local es más reciente (hay mutación en outbox) → local gana, no se sobreescribe
    *
-   * "Initial Hydration" (nuevo dispositivo / browser limpio):
-   *  Si lastSyncedAt es null, fetchRemoteWorkspaces devuelve TODOS los registros.
-   *  Esto permite que un usuario con datos en Supabase los recupere en un nuevo browser.
+   * No dispara re-enqueue — REMOTE_MERGE nunca añade al outbox (evita loops).
    */
   const reconcile = useCallback(async () => {
     const currentUser  = userRef.current;
@@ -443,64 +453,92 @@ export function WorkspaceProvider({ children }) {
 
     if (!currentUser?.supabaseUid || !currentUser?.uid) return;
     if (!isCloudConfigured()) return;
-    if (currentState.status !== 'ready') return;
+    if (currentState.status !== 'ready')  return;
 
     dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
 
     try {
-      const remoteList = await CloudService.fetchRemoteWorkspaces(
+      // Fetch delta normalizado desde Supabase
+      const delta = await CloudService.fetchDelta(
         currentUser.supabaseUid,
-        currentState.lastSyncedAt,  // null → full fetch (initial hydration)
+        currentState.lastSyncedAt,
       );
 
-      for (const remote of remoteList) {
-        // Buscar el workspace local por idb_id
-        if (remote.idb_id !== currentState.workspaceId) {
-          // Workspace de otro dispositivo que no existe localmente → crear en IDB
-          // (Fase 4: soporte single-workspace. Multi-workspace en Fase 5)
-          continue;
-        }
+      let anyMerge = false;
 
-        const remoteTime = new Date(remote.updated_at).getTime();
-        const localTime  = currentState.workspaceUpdatedAt
-          ? new Date(currentState.workspaceUpdatedAt).getTime()
-          : 0;
-
-        if (remoteTime > localTime) {
-          // Remote es más reciente — merge sin re-encolar (no hay cambio local)
-          dispatch({
-            type:    'REMOTE_MERGE',
-            payload: {
-              sheets:    remote.sheets,
-              name:      remote.name,
-              updatedAt: remote.updated_at,
-            },
-          });
-
-          // Persistir en IDB para que el state refleje la fuente de verdad
-          await WorkspaceService.saveSheets(
-            currentState.workspaceId,
-            currentUser.uid,
-            remote.sheets,
-          );
-        }
-        // else: local es más reciente → ya está en la queue → se subirá ahora
+      // ── Reconciliar workspaces ────────────────────────────────────────────
+      for (const remoteWs of (delta.workspaces ?? [])) {
+        if (remoteWs.id !== currentState.workspaceId) continue;
+        await WorkspaceService.updateName(remoteWs.id, currentUser.uid, remoteWs.name);
+        anyMerge = true;
       }
 
-      // Después de reconciliar, drenar la queue (datos locales más recientes → subir)
-      if (syncQueueRef.current.size > 0) {
-        await drainQueue();
+      // ── Reconciliar sheets ────────────────────────────────────────────────
+      for (const remoteSheet of (delta.sheets ?? [])) {
+        const localSheet = currentState.sheets.find((s) => s.id === remoteSheet.id);
+        const remoteTs   = new Date(remoteSheet.updated_at).getTime();
+        const localTs    = localSheet ? new Date(localSheet.updated_at ?? 0).getTime() : 0;
+
+        if (remoteTs > localTs) {
+          await SheetService.upsertFromRemote(remoteSheet, currentUser.uid);
+          anyMerge = true;
+        }
+      }
+
+      // ── Reconciliar tasks ─────────────────────────────────────────────────
+      for (const remoteTask of (delta.tasks ?? [])) {
+        const localSheet = currentState.sheets.find((s) => s.id === remoteTask.sheet_id);
+        const localTask  = localSheet?.tasks?.find((t) => t.id === remoteTask.id);
+        const remoteTs   = new Date(remoteTask.updated_at).getTime();
+        const localTs    = localTask ? new Date(localTask.updated_at ?? 0).getTime() : 0;
+
+        if (remoteTs > localTs) {
+          await TaskService.upsertFromRemote(remoteTask, currentUser.uid);
+          anyMerge = true;
+        }
+      }
+
+      // ── Reconciliar expenses ──────────────────────────────────────────────
+      for (const remoteExp of (delta.expenses ?? [])) {
+        const localSheet   = currentState.sheets.find((s) => s.id === remoteExp.sheet_id);
+        const localExpense = localSheet?.expenses?.find((e) => e.id === remoteExp.id);
+        const remoteTs     = new Date(remoteExp.updated_at).getTime();
+        const localTs      = localExpense ? new Date(localExpense.updated_at ?? 0).getTime() : 0;
+
+        if (remoteTs > localTs) {
+          await ExpenseService.upsertFromRemote(remoteExp, currentUser.uid);
+          anyMerge = true;
+        }
+      }
+
+      // Si hubo cambios remotos, recargar la vista completa desde IDB
+      if (anyMerge) {
+        const updated = await WorkspaceService.loadFull(
+          currentState.workspaceId,
+          currentUser.uid,
+        );
+        dispatch({
+          type:    'REMOTE_MERGE',
+          payload: { sheets: updated.sheets, workspaceName: updated.name },
+        });
+      }
+
+      // Drenar el outbox (datos locales más recientes → subir)
+      if (await OutboxService.count() > 0) {
+        await drainOutbox();
       } else {
-        const now = new Date().toISOString();
-        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: now });
-        dispatch({ type: 'SET_LAST_SYNCED', payload: now });
+        const nowIso = new Date().toISOString();
+        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
+        dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
       }
 
     } catch (err) {
-      console.error('[WorkspaceContext] Reconciliation error:', err.message);
+      console.error('[WorkspaceContext] reconcile error:', err.message);
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'error', error: err.message } });
     }
-  }, [drainQueue]);
+  }, [drainOutbox]);
+
+  // ─── Network events ─────────────────────────────────────────────────────────
 
   useEffect(() => {
     const handleOnline  = () => reconcile();
@@ -508,14 +546,10 @@ export function WorkspaceProvider({ children }) {
 
     window.addEventListener('online',  handleOnline);
     window.addEventListener('offline', handleOffline);
-
-    // Inicializar estado de red al montar
     if (!navigator.onLine) {
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
     }
-
     return () => {
-      // Limpieza de listeners — evita memory leaks
       window.removeEventListener('online',  handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
@@ -529,66 +563,142 @@ export function WorkspaceProvider({ children }) {
 
   // ── Sheets ──────────────────────────────────────────────────────────────────
 
-  const addSheet = useCallback((name = 'Nueva hoja') => {
-    dispatch({ type: 'ADD_SHEET', payload: name });
-    enqueue();
+  const addSheet = useCallback(async (name = 'Nueva hoja') => {
+    const currentUser  = userRef.current;
+    const currentState = latestStateRef.current;
+    if (!currentUser?.uid || !currentState.workspaceId) return;
+
+    const position = currentState.sheets.length;
+    // 1. Escribir en IDB (operación granular)
+    const rec = await SheetService.create({
+      workspaceId: currentState.workspaceId,
+      ownerId:     currentUser.uid,
+      name,
+      position,
+    });
+
+    // 2. Optimistic update en React (inmediato)
+    const sheetView = { ...rec, tasks: [], expenses: [] };
+    dispatch({ type: 'ADD_SHEET', payload: sheetView });
+
+    // 3. Encolar mutación en outbox (durable)
+    await enqueue({
+      type:    MutationType.UPSERT_WORKSPACE,
+      payload: { id: currentState.workspaceId, name: currentState.workspaceName },
+    });
+    await enqueue({
+      type:    MutationType.UPSERT_SHEET,
+      payload: {
+        id:           rec.id,
+        workspace_id: rec.workspace_id,
+        name:         rec.name,
+        capital:      rec.capital,
+        position:     rec.position,
+      },
+    });
   }, [enqueue]);
 
-  const renameSheet = useCallback((sheetId, name) => {
+  const renameSheet = useCallback(async (sheetId, name) => {
     if (!name?.trim()) return;
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    await SheetService.update(sheetId, currentUser.uid, { name });
     dispatch({ type: 'RENAME_SHEET', payload: { sheetId, name } });
-    enqueue();
+    await enqueue({ type: MutationType.UPSERT_SHEET, payload: { id: sheetId, name } });
   }, [enqueue]);
 
-  const removeSheet = useCallback((sheetId) => {
+  const removeSheet = useCallback(async (sheetId) => {
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    // softDelete propaga tombstone a tasks/expenses de la sheet
+    await SheetService.softDelete(sheetId, currentUser.uid);
     dispatch({ type: 'REMOVE_SHEET', payload: sheetId });
-    enqueue();
+    // Supabase CASCADE elimina tasks/expenses — solo necesitamos DELETE_SHEET
+    await enqueue({ type: MutationType.DELETE_SHEET, payload: { id: sheetId } });
   }, [enqueue]);
 
-  // ── Finanzas ────────────────────────────────────────────────────────────────
+  // ── Finanzas ─────────────────────────────────────────────────────────────────
 
-  const setCapital = useCallback((sheetId, capital) => {
+  const setCapital = useCallback(async (sheetId, capital) => {
     const parsed = parseFloat(capital);
     if (isNaN(parsed)) return;
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    await SheetService.update(sheetId, currentUser.uid, { capital: parsed });
     dispatch({ type: 'SET_CAPITAL', payload: { sheetId, capital: parsed } });
-    enqueue();
+    await enqueue({ type: MutationType.UPSERT_SHEET, payload: { id: sheetId, capital: parsed } });
   }, [enqueue]);
 
-  const addExpense = useCallback((sheetId, { desc, amount }) => {
+  const addExpense = useCallback(async (sheetId, { desc, amount }) => {
     if (!desc?.trim() || !amount) return;
-    dispatch({ type: 'ADD_EXPENSE', payload: { sheetId, expense: { desc, amount } } });
-    enqueue();
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    const rec = await ExpenseService.create({
+      sheetId,
+      ownerId:     currentUser.uid,
+      description: desc,
+      amount,
+    });
+    // Adaptar nomenclatura para compatibilidad con Dashboard.jsx (usa `desc`)
+    const expView = { ...rec, desc: rec.description };
+    dispatch({ type: 'ADD_EXPENSE', payload: { sheetId, expense: expView } });
+    await enqueue({
+      type:    MutationType.UPSERT_EXPENSE,
+      payload: { id: rec.id, sheet_id: sheetId, description: rec.description, amount: rec.amount },
+    });
   }, [enqueue]);
 
-  const removeExpense = useCallback((sheetId, expenseId) => {
+  const removeExpense = useCallback(async (sheetId, expenseId) => {
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    await ExpenseService.softDelete(expenseId, currentUser.uid);
     dispatch({ type: 'REMOVE_EXPENSE', payload: { sheetId, expenseId } });
-    enqueue();
+    await enqueue({ type: MutationType.DELETE_EXPENSE, payload: { id: expenseId } });
   }, [enqueue]);
 
-  // ── Tareas ──────────────────────────────────────────────────────────────────
+  // ── Tareas ───────────────────────────────────────────────────────────────────
 
-  const addTask = useCallback((sheetId, text) => {
+  const addTask = useCallback(async (sheetId, text) => {
     if (!text?.trim()) return;
-    dispatch({ type: 'ADD_TASK', payload: { sheetId, text } });
-    enqueue();
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    const rec = await TaskService.create({ sheetId, ownerId: currentUser.uid, text });
+    dispatch({ type: 'ADD_TASK', payload: { sheetId, task: rec } });
+    await enqueue({
+      type:    MutationType.UPSERT_TASK,
+      payload: { id: rec.id, sheet_id: sheetId, text: rec.text, completed: rec.completed },
+    });
   }, [enqueue]);
 
-  const toggleTask = useCallback((sheetId, taskId) => {
+  const toggleTask = useCallback(async (sheetId, taskId) => {
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    const updated = await TaskService.toggle(taskId, currentUser.uid);
     dispatch({ type: 'TOGGLE_TASK', payload: { sheetId, taskId } });
-    enqueue();
+    await enqueue({
+      type:    MutationType.UPSERT_TASK,
+      payload: { id: updated.id, sheet_id: sheetId, text: updated.text, completed: updated.completed },
+    });
   }, [enqueue]);
 
-  const removeTask = useCallback((sheetId, taskId) => {
+  const removeTask = useCallback(async (sheetId, taskId) => {
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return;
+
+    await TaskService.softDelete(taskId, currentUser.uid);
     dispatch({ type: 'REMOVE_TASK', payload: { sheetId, taskId } });
-    enqueue();
+    await enqueue({ type: MutationType.DELETE_TASK, payload: { id: taskId } });
   }, [enqueue]);
 
-  // ── forceSync: trigger manual ────────────────────────────────────────────────
+  // ── forceSync ────────────────────────────────────────────────────────────────
 
-  /**
-   * Fuerza una reconciliación completa seguida de drain del queue.
-   * Expuesto en el contexto para que NavBar pueda ofrecer un botón de sync manual.
-   */
   const forceSync = useCallback(async () => {
     if (!navigator.onLine) {
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
@@ -608,17 +718,18 @@ export function WorkspaceProvider({ children }) {
 
   const value = useMemo(
     () => ({
-      // Estado local
-      status:        state.status,
-      error:         state.error,
-      sheets:        state.sheets,
-      activeSheetId: state.activeSheetId,
+      // Estado
+      status:           state.status,
+      error:            state.error,
+      sheets:           state.sheets,
+      activeSheetId:    state.activeSheetId,
       activeSheet,
-      isReady:       state.status === 'ready',
-      // Estado de sync
-      syncStatus:    state.syncStatus,
-      syncError:     state.syncError,
-      lastSyncedAt:  state.lastSyncedAt,
+      isReady:          state.status === 'ready',
+      // Sync
+      syncStatus:       state.syncStatus,
+      syncError:        state.syncError,
+      lastSyncedAt:     state.lastSyncedAt,
+      pendingMutations: state.pendingMutations,
       // Navegación
       setActiveSheet,
       // Sheets
@@ -638,7 +749,7 @@ export function WorkspaceProvider({ children }) {
     }),
     [
       state.status, state.error, state.sheets, state.activeSheetId,
-      state.syncStatus, state.syncError, state.lastSyncedAt,
+      state.syncStatus, state.syncError, state.lastSyncedAt, state.pendingMutations,
       activeSheet,
       setActiveSheet,
       addSheet, renameSheet, removeSheet,
