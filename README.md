@@ -50,3 +50,20 @@ El sistema está preparado para escalar de 500 a 50,000 usuarios mediante los si
 
 ---
 **Desarrollado con mentalidad Enterprise | 2026**
+
+
+
+
+
+## 🚀 Estado del Proyecto: Fase 5 - Enterprise Sync (En curso)
+
+Hemos evolucionado la estructura de datos de un modelo basado en documentos JSON a un modelo **Relacional de Tercera Forma Normal (3NF)**.
+
+### Cambios Clave:
+- **Esquema Relacional:** Tablas independientes para `workspaces`, `sheets`, `tasks` y `expenses`.
+- **Delta Sync Engine:** La aplicación ya no sube todo el workspace; ahora solo envía los "deltas" (cambios específicos) optimizando el ancho de banda.
+- **Offline-First Avanzado:** Implementación de una cola de salida (**Outbox**) persistente en IndexedDB que garantiza que ningún cambio se pierda si falla la conexión.
+- **Seguridad:** Row Level Security (RLS) aplicado a nivel de fila en todas las tablas mediante `owner_id`.
+
+### Pendiente:
+- Finalizar el drenado del Outbox inicial (Migración de datos legacy de local a nube).
