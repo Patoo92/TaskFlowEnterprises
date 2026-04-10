@@ -1,10 +1,81 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
+
+    <!--
+      ─── Content Security Policy — TaskFlow Enterprise v1.0.1 ───────────────────
+      Mitiga ataques XSS reduciendo las fuentes desde las que el browser
+      acepta scripts, estilos, imágenes y conexiones de red.
+
+      Directivas explicadas:
+        default-src 'self'
+          Política base: solo recursos del mismo origen. Todas las demás
+          directivas son refinamientos de este comportamiento base.
+
+        script-src 'self' 'unsafe-inline' https://accounts.google.com
+          'self'                    → scripts de /src (compilados por Vite)
+          'unsafe-inline'           → necesario para Vite HMR en desarrollo
+                                      y para el botón de Google Identity Services
+                                      que inyecta inline scripts en su iframe
+          https://accounts.google.com → Google Identity Services SDK
+
+        style-src 'self' 'unsafe-inline'
+          'unsafe-inline' → Tailwind CSS genera estilos inline en runtime
+                            (JIT mode). Eliminar requeriría añadir un hash
+                            por cada clase generada — inviable con Tailwind.
+
+        img-src 'self' data: https:
+          'self'  → imágenes del bundle (favicon, etc.)
+          data:   → avatares en Base64 (photoURL almacenado en IDB)
+          https:  → avatares externos de Google (payload.picture del JWT)
+
+        connect-src 'self' https://*.supabase.co wss://*.supabase.co https://accounts.google.com
+          'self'                    → llamadas a la propia API (si las hubiera)
+          https://*.supabase.co     → REST API de Supabase
+          wss://*.supabase.co       → WebSockets de Supabase Realtime
+          https://accounts.google.com → Google OAuth token endpoint
+
+        frame-src https://accounts.google.com
+          El botón <GoogleLogin /> renderiza un iframe firmado por Google.
+          Sin esta directiva, el iframe es bloqueado y el login falla.
+
+        object-src 'none'
+          Bloquea plugins (<object>, <embed>, <applet>) — vector de ataque clásico.
+
+        base-uri 'self'
+          Previene ataques de inyección de <base href> que redirigen
+          todas las URLs relativas a un origen controlado por el atacante.
+
+        form-action 'self'
+          Limita el destino de los <form action="..."> al propio origen.
+          Previene exfiltración de datos via form hijacking.
+
+      NOTA PARA PRODUCCIÓN:
+        Eliminar 'unsafe-inline' de script-src y reemplazar por nonces generados
+        en el servidor (Vite SSR o Nginx). Esto requiere configurar el servidor
+        de despliegue para inyectar el nonce en cada respuesta HTML y en cada
+        script inline. Consulta la documentación de Vercel/Netlify/Cloudflare
+        Pages para su implementación específica.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' https://accounts.google.com;
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: https:;
+        connect-src 'self' https://*.supabase.co wss://*.supabase.co https://accounts.google.com;
+        frame-src https://accounts.google.com;
+        object-src 'none';
+        base-uri 'self';
+        form-action 'self';
+      "
+    />
+
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>taskflow-enterprise</title>
+    <title>TaskFlow Enterprise</title>
   </head>
   <body>
     <div id="root"></div>

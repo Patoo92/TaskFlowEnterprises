@@ -1,6 +1,7 @@
 /**
  * @file AuthContext.jsx
  * @description Contexto global de autenticación para TaskFlow Enterprise.
+ * @version 1.0.1 — Parches de seguridad y estabilidad
  *
  * Responsabilidades:
  *  - Registro/Login manual (validado contra IndexedDB via UserService)
@@ -12,11 +13,22 @@
  * Flujo Google OAuth (sin backend):
  *  <GoogleLogin onSuccess> recibe credentialResponse.credential (ID Token JWT)
  *  → jwtDecode(jwt) extrae { sub, email, name, picture }
+ *  → Se valida la expiración del token (campo `exp`)
  *  → UserService.findOrCreateGoogle crea o recupera el usuario en IndexedDB
- *  → Cookie de sesión renovada (7 días)
+ *  → Cookie de sesión renovada (7 días, sin photoURL para evitar límite 4KB)
  *
  * Flujo de rehidratación:
  *  Cookie "tf_session" → revalidar uid en IDB → AUTH_SUCCESS | limpiar cookie
+ *
+ * ── Cambios v1.0.1 ────────────────────────────────────────────────────────────
+ *  [FIX-01] ReferenceError: `supabaseUid` undefined en updateProfile.
+ *           Ahora se lee de `persistedUser.supabaseUid` (devuelto por IDB).
+ *  [FIX-02] Cookie de sesión ya NO incluye `photoURL` (Base64 puede exceder 4KB).
+ *           La foto se lee desde IDB en la rehidratación.
+ *  [FIX-03] decodeGoogleCredential valida el campo `exp` del JWT para rechazar
+ *           tokens expirados antes de crear la sesión.
+ *  [OPT-01] updateProfile usa `userRef` para acceder al user más reciente sin
+ *           recrear la función en cada cambio de state.user (stable reference).
  */
 
 import {
@@ -26,6 +38,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
 } from 'react';
 import Cookies from 'js-cookie';
 import { jwtDecode } from 'jwt-decode';
@@ -43,8 +56,8 @@ const SESSION_COOKIE = 'tf_session';
  * por lo que las cookies funcionan sin HTTPS.
  */
 const COOKIE_OPTIONS = {
-  expires: 7,
-  secure: import.meta.env.PROD,
+  expires:  7,
+  secure:   import.meta.env.PROD,
   sameSite: 'Strict',
 };
 
@@ -66,6 +79,7 @@ function authReducer(state, action) {
       return { status: 'unauthenticated', user: null, error: action.payload };
     case 'LOGOUT':
       return { status: 'unauthenticated', user: null, error: null };
+
     // Optimistic: payload = { displayName?, photoURL? } — aplica inmediatamente en UI
     case 'UPDATE_PROFILE':
       return { ...state, user: { ...state.user, ...action.payload } };
@@ -77,8 +91,10 @@ function authReducer(state, action) {
     // Legacy alias — mantener compatibilidad
     case 'PROFILE_UPDATED':
       return { ...state, user: { ...state.user, ...action.payload } };
+
     case 'CLEAR_ERROR':
       return { ...state, error: null };
+
     default:
       return state;
   }
@@ -96,12 +112,13 @@ const AuthContext = createContext(null);
  */
 function mapErrorMessage(code) {
   const messages = {
-    EMAIL_ALREADY_EXISTS:  'Este email ya está registrado.',
-    INVALID_CREDENTIALS:   'Email o contraseña incorrectos.',
-    USER_NOT_FOUND:        'Sesión expirada. Por favor inicia sesión de nuevo.',
-    VALIDATION_ERROR:      'Datos inválidos. Revisa los campos.',
-    GOOGLE_DECODE_ERROR:   'No se pudo leer el token de Google. Inténtalo de nuevo.',
-    GOOGLE_MISSING_FIELDS: 'Google no devolvió los datos necesarios (email o ID).',
+    EMAIL_ALREADY_EXISTS:    'Este email ya está registrado.',
+    INVALID_CREDENTIALS:     'Email o contraseña incorrectos.',
+    USER_NOT_FOUND:          'Sesión expirada. Por favor inicia sesión de nuevo.',
+    VALIDATION_ERROR:        'Datos inválidos. Revisa los campos.',
+    GOOGLE_DECODE_ERROR:     'No se pudo leer el token de Google. Inténtalo de nuevo.',
+    GOOGLE_TOKEN_EXPIRED:    'El token de Google ha expirado. Inicia sesión de nuevo.',
+    GOOGLE_MISSING_FIELDS:   'Google no devolvió los datos necesarios (email o ID).',
     SUPABASE_NOT_CONFIGURED: 'Sincronización cloud no configurada (local-only mode).',
   };
   return messages[code] ?? 'Ocurrió un error inesperado. Inténtalo de nuevo.';
@@ -109,8 +126,8 @@ function mapErrorMessage(code) {
 
 function validateRegistration({ email, password, displayName }) {
   if (!displayName || displayName.trim().length < 2) throw new Error('VALIDATION_ERROR');
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('VALIDATION_ERROR');
-  if (!password || password.length < 8) throw new Error('VALIDATION_ERROR');
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))  throw new Error('VALIDATION_ERROR');
+  if (!password || password.length < 8)                      throw new Error('VALIDATION_ERROR');
 }
 
 function validateLogin({ email, password }) {
@@ -127,12 +144,23 @@ function validateLogin({ email, password }) {
  *   email   → email del usuario
  *   name    → nombre completo
  *   picture → URL pública del avatar
+ *   exp     → Unix timestamp de expiración (validado aquí — [FIX-03])
  *
  * @param {string} credential — ID Token JWT de Google
  * @returns {{ googleId: string, email: string, displayName: string, photoURL: string|null }}
+ * @throws {Error} GOOGLE_TOKEN_EXPIRED si el token ya expiró
+ * @throws {Error} GOOGLE_MISSING_FIELDS si faltan sub o email
  */
 function decodeGoogleCredential(credential) {
   const payload = jwtDecode(credential);
+
+  // [FIX-03] Validar expiración antes de crear la sesión.
+  // jwtDecode v4 no verifica `exp` automáticamente — lo hacemos manualmente.
+  // Math.floor(Date.now() / 1000) → Unix timestamp en segundos (igual que `exp`)
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (payload.exp && payload.exp < nowSec) {
+    throw new Error('GOOGLE_TOKEN_EXPIRED');
+  }
 
   const googleId    = payload.sub;
   const email       = payload.email;
@@ -146,6 +174,16 @@ function decodeGoogleCredential(credential) {
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 
+/**
+ * Serializa solo los metadatos esenciales de sesión en la cookie.
+ *
+ * [FIX-02] `photoURL` eliminado intencionalmente:
+ *   - Un avatar Base64 comprimido puede superar fácilmente los 4KB de límite de cookie.
+ *   - Las cookies viajan en cada request HTTP, encareciendo la transferencia.
+ *   - La foto se recupera desde IndexedDB durante la rehidratación (fuente de verdad).
+ *
+ * @param {Object} user - Objeto usuario completo (con o sin photoURL)
+ */
 function setSessionCookie(user) {
   Cookies.set(
     SESSION_COOKIE,
@@ -153,9 +191,8 @@ function setSessionCookie(user) {
       uid:         user.uid,
       email:       user.email,
       displayName: user.displayName,
-      photoURL:    user.photoURL,
-      // Añadimos esto para que no se olvide tras recargar la página:
-      supabaseUid: user.supabaseUid || null,
+      // photoURL omitido — se lee desde IDB en rehidratación [FIX-02]
+      supabaseUid: user.supabaseUid ?? null,
     }),
     COOKIE_OPTIONS,
   );
@@ -215,33 +252,43 @@ async function syncSupabaseAuth(method, credentials, localUid) {
 export function AuthProvider({ children }) {
   const [state, dispatch] = useReducer(authReducer, initialState);
 
+  // [OPT-01] Ref que siempre apunta al user más reciente.
+  // Permite que updateProfile acceda al user actual sin cerrarse sobre
+  // state.user ni recrearse en cada cambio (stable callback reference).
+  const userRef = useRef(state.user);
+  useEffect(() => { userRef.current = state.user; }, [state.user]);
+
   // ── Rehidratación al montar ─────────────────────────────────────────────────
   useEffect(() => {
     async function rehydrate() {
-  dispatch({ type: 'LOADING' });
-  const session = getSessionCookie();
+      dispatch({ type: 'LOADING' });
+      const session = getSessionCookie();
 
-  if (!session?.uid) {
-    dispatch({ type: 'AUTH_FAILURE', payload: null });
-    return;
-  }
+      if (!session?.uid) {
+        dispatch({ type: 'AUTH_FAILURE', payload: null });
+        return;
+      }
 
-  try {
-    const idbUser = await UserService.getById(session.uid);
-    
-    // Rescate crítico del UID de Supabase (Solución al "F5 de la Muerte")
-    const finalUser = {
-      ...idbUser,
-      supabaseUid: idbUser.supabaseUid || session.supabaseUid || null,
-    };
+      try {
+        // IDB es la fuente de verdad: incluye photoURL completo que la cookie no lleva
+        const idbUser = await UserService.getById(session.uid);
 
-    setSessionCookie(finalUser); 
-    dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
-  } catch (err) {
-    clearSessionCookie();
-    dispatch({ type: 'AUTH_FAILURE', payload: mapErrorMessage(err.message) });
-  }
-}
+        // Rescate crítico del UID de Supabase ("F5 de la Muerte"):
+        // IDB tiene el supabaseUid si fue persistido por linkSupabase;
+        // la cookie lo tiene como fallback si IDB no lo guardó todavía.
+        const finalUser = {
+          ...idbUser,
+          supabaseUid: idbUser.supabaseUid || session.supabaseUid || null,
+        };
+
+        // Refrescar cookie (renueva los 7 días de expiración)
+        setSessionCookie(finalUser);
+        dispatch({ type: 'AUTH_SUCCESS', payload: finalUser });
+      } catch (err) {
+        clearSessionCookie();
+        dispatch({ type: 'AUTH_FAILURE', payload: mapErrorMessage(err.message) });
+      }
+    }
 
     rehydrate();
   }, []);
@@ -278,7 +325,7 @@ export function AuthProvider({ children }) {
 
       // Auth bridge + restore supabaseUid from sync_meta if already linked
       let finalUser = user;
-      const meta = await SyncMetaService.get(user.uid);
+      const meta    = await SyncMetaService.get(user.uid);
       if (meta?.supabaseUid) {
         // Usuario ya vinculado — solo refrescar la sesión de Supabase
         finalUser = { ...user, supabaseUid: meta.supabaseUid };
@@ -311,6 +358,8 @@ export function AuthProvider({ children }) {
    * El conflicto de IDB del mock desaparece porque ahora cada usuario de Google
    * tiene un `googleId` real y estable (campo `sub` del JWT), no un timestamp.
    *
+   * [FIX-03] decodeGoogleCredential valida `exp` antes de proceder.
+   *
    * @param {import('@react-oauth/google').CredentialResponse} credentialResponse
    */
   const loginWithGoogle = useCallback(async (credentialResponse) => {
@@ -318,6 +367,7 @@ export function AuthProvider({ children }) {
     try {
       if (!credentialResponse?.credential) throw new Error('GOOGLE_DECODE_ERROR');
 
+      // Decodifica y valida exp, sub, email
       const profile = decodeGoogleCredential(credentialResponse.credential);
       const user    = await UserService.findOrCreateGoogle(profile);
 
@@ -354,42 +404,55 @@ export function AuthProvider({ children }) {
   // ── Actualización de perfil (Optimistic Update + Rollback) ──────────────────
   //
   // Flujo:
-  //  1. Guarda snapshot del user actual (para rollback)
+  //  1. Guarda snapshot del user actual via userRef (evita stale closures)
   //  2. Aplica UPDATE_PROFILE en React inmediatamente (UI no espera a IDB)
   //  3. Intenta persistir en IndexedDB (compresión de imagen incluida en db.js)
-  //  4a. Éxito → refresca cookie con datos del DB (tiene el Base64 comprimido real)
+  //  4a. Éxito → refresca cookie y sincroniza React con el Base64 comprimido real
   //  4b. Fallo  → ROLLBACK_PROFILE restaura el snapshot y devuelve el error
   //
+  // [FIX-01] Eliminada la línea `persistedUser.supabaseUid = supabaseUid` que
+  //          causaba ReferenceError. El supabaseUid ya viene incluido en el objeto
+  //          devuelto por UserService.updateProfile (IDB preserva todos los campos).
+  //
+  // [OPT-01] useCallback ya no depende de state.user — usa userRef para leer
+  //          el valor actual. La función es estable durante toda la vida del Provider,
+  //          eliminando re-renders innecesarios en todos sus consumers.
+  //
   const updateProfile = useCallback(async (updates) => {
-    if (!state.user?.uid) return { success: false, error: 'No autenticado.' };
+    const currentUser = userRef.current;
+    if (!currentUser?.uid) return { success: false, error: 'No autenticado.' };
 
-    // Snapshot para rollback
-    const previousUser = state.user;
+    // Snapshot para rollback (leído desde ref — siempre el más reciente)
+    const previousUser = currentUser;
 
-    // ── Optimistic update — React UI es inmediata ─────────────────────────
+    // ── Optimistic update — React UI es inmediata ─────────────────────────────
     dispatch({ type: 'UPDATE_PROFILE', payload: updates });
 
     try {
-      // db.js comprimirá el photoURL si está presente antes de escribir en IDB
-      const persistedUser = await UserService.updateProfile(state.user.uid, updates);
-      persistedUser.supabaseUid = supabaseUid; // <--- AGREGÁ ESTA LÍNEA
-      // Actualizar cookie con el Base64 comprimido real que devuelve la DB
+      // db.js comprimirá el photoURL si está presente antes de escribir en IDB.
+      // El objeto devuelto incluye todos los campos del usuario (supabaseUid incluido).
+      const persistedUser = await UserService.updateProfile(currentUser.uid, updates);
+
+      // Actualizar cookie con metadatos frescos (sin photoURL — [FIX-02])
       setSessionCookie(persistedUser);
 
-      // Sincronizar estado React con los datos persistidos (puede diferir del
-      // optimistic si la compresión cambió el photoURL)
-      dispatch({ type: 'UPDATE_PROFILE', payload: {
-        displayName: persistedUser.displayName,
-        photoURL:    persistedUser.photoURL,
-      }});
+      // Sincronizar estado React con los datos persistidos (el photoURL puede diferir
+      // del optimistic si la compresión redujo el tamaño o calidad del Base64)
+      dispatch({
+        type:    'UPDATE_PROFILE',
+        payload: {
+          displayName: persistedUser.displayName,
+          photoURL:    persistedUser.photoURL,
+        },
+      });
 
       return { success: true };
     } catch (err) {
-      // ── Rollback — restaurar snapshot anterior ────────────────────────────
+      // ── Rollback — restaurar snapshot anterior ────────────────────────────────
       dispatch({ type: 'ROLLBACK_PROFILE', payload: previousUser });
       return { success: false, error: mapErrorMessage(err.message) };
     }
-  }, [state.user]);
+  }, []); // Stable: no depende de state.user gracias a userRef [OPT-01]
 
   const clearError = useCallback(() => dispatch({ type: 'CLEAR_ERROR' }), []);
 
@@ -401,7 +464,7 @@ export function AuthProvider({ children }) {
     isAuthenticated: state.status === 'authenticated',
     isLoading:       state.status === 'loading' || state.status === 'idle',
     // supabaseUid — disponible para WorkspaceContext (owner_id en RLS)
-    supabaseUid: state.user?.supabaseUid ?? null,
+    supabaseUid:     state.user?.supabaseUid ?? null,
     register,
     login,
     loginWithGoogle,
