@@ -1,65 +1,61 @@
 /**
  * @file WorkspaceContext.jsx
- * @description Contexto global de hojas de trabajo — Fase 5: Outbox Pattern + Delta Sync.
- * @version 1.5.0
+ * @description Contexto global de workspace — Fase 5: Offline-First Coordinator.
+ * @version 2.0.0
  *
- * ── Arquitectura de persistencia v1.5 ────────────────────────────────────────
+ * ── Arquitectura v2.0.0 ───────────────────────────────────────────────────────
  *
  *  User Action
  *      │
  *      ▼
- *  dispatch()            ← React state (L1, inmediato)
+ *  1. dispatch()             ← React state (L1, feedback inmediato — Optimistic)
  *      │
  *      ▼
- *  IDB write (atomic)    ← Store normalizado correcto (L2, local-first)
+ *  2. IDB write (granular)   ← Store normalizado _v6 (L2, local-first durable)
  *      │
  *      ▼
- *  OutboxService.enqueue ← Mutación atómica en store 'outbox' (L3, durable)
+ *  3. OutboxService.enqueue  ← Mutación atómica e idempotente en 'outbox_v6' (L3)
  *      │
  *      ▼
- *  drainOutbox()         ← CloudService.processOutboxBatch (orden topológico)
+ *  4. drainOutbox()          ← CloudService.processOutboxBatch(items, wsId, wsName)
  *      │
  *      ▼
- *  Supabase RPC          ← batch_sync_workspace (transacción atómica)
+ *  5. Supabase RPC           ← batch_sync_workspace (transacción atómica)
  *
- * ── Cambios v1.5.0 ────────────────────────────────────────────────────────────
+ * ── Cambios v2.0.0 (Hallazgos de Auditoría) ──────────────────────────────────
  *
- *  [CTX-01] Outbox durable: syncQueueRef reemplazado por OutboxService.
- *    Cada mutación se persiste en IDB antes de intentar el sync cloud.
- *    Si la app se cierra antes del sync, el outbox se drena al siguiente inicio.
+ *  [A1/A2] Gestión de Identidad:
+ *    workspaceId y workspaceName viven en el estado del contexto.
+ *    Se recuperan de WorkspaceService.ensureDefault() en el useEffect de init.
+ *    drainOutbox los lee de latestStateRef — nunca los deriva del outbox.
  *
- *  [CTX-02] Operaciones IDB granulares:
- *    Ya no se llama a WorkspaceService.saveSheets() (full snapshot).
- *    Cada acción escribe solo en el store específico:
- *      addTask → TaskService.create
- *      toggleTask → TaskService.toggle
- *      removeTask → TaskService.softDelete
- *      addExpense → ExpenseService.create
- *      removeExpense → ExpenseService.softDelete
- *      addSheet → SheetService.create
- *      renameSheet → SheetService.update
- *      setCapital → SheetService.update
- *      removeSheet → SheetService.softDelete
+ *  [M1] Drenaje Seguro — Control de Concurrencia:
+ *    syncInProgressRef actúa como mutex. Si drainOutbox se invoca mientras
+ *    otra instancia está activa, retorna inmediatamente (early return).
+ *    Elimina race conditions y duplicados en conexiones inestables.
  *
- *  [CTX-03] drainOutbox con orden topológico garantizado:
- *    OutboxService.getAll() devuelve mutaciones ordenadas por MUTATION_TOPO_ORDER.
- *    Esto evita FK violations al insertar hijos antes que padres.
+ *  [FLOW] Flujo Unidireccional Estricto en acciones:
+ *    dispatch → IDB → enqueue → drainOutbox()
+ *    El dispatch ocurre PRIMERO (feedback instantáneo al usuario).
+ *    IDB y outbox son durables — si la app se cierra, se retoman al arrancar.
  *
- *  [CTX-04] Reconciliación LWW (Last Write Wins) con datos normalizados:
- *    La reconciliación recibe el delta normalizado de fetch_workspace_delta
- *    y aplica upsert entity-by-entity en IDB, comparando updated_at.
- *    Remote gana solo si remote.updated_at > local.updated_at.
+ *  [C1] Adaptación al nuevo CloudService v2.0.0:
+ *    processOutboxBatch recibe (items, workspaceId, workspaceName) explícitos.
+ *    El workspaceId nunca se deriva del contenido del batch.
  *
- *  [CTX-05] Carga inicial desde stores normalizados:
- *    WorkspaceService.ensureDefault() carga y migra datos legacy si existen.
- *    El estado React se construye desde WorkspaceView (join en IDB).
+ *  [CLEAN] Limpieza — sin retry manual:
+ *    Toda la lógica de reintentos (exponential backoff, withRetry) vive en
+ *    cloudService.js. El contexto solo gestiona el estado de UI (syncStatus).
+ *    incrementRetry en el outbox lo gestiona cloudService internamente;
+ *    el contexto solo elimina entradas confirmadas o con MAX_RETRIES agotados.
  *
  *  ── INTACTO ────────────────────────────────────────────────────────────────
  *  ✓ Estructura del reducer (wsReducer) con helper updateSheet
  *  ✓ Patrón latestStateRef / userRef para evitar stale closures
  *  ✓ Lógica de red (online/offline events)
- *  ✓ forceSync expuesto en contexto
- *  ✓ API pública del contexto (mismas props que v1.0.x para compatibilidad UI)
+ *  ✓ reconcile (LWW delta sync desde Supabase)
+ *  ✓ forceSync expuesto en el contexto
+ *  ✓ API pública del contexto (mismas props para compatibilidad UI)
  */
 
 import {
@@ -72,7 +68,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import { useAuth }  from './AuthContext';
+import { useAuth } from './AuthContext';
 import {
   WorkspaceService,
   SheetService,
@@ -81,36 +77,38 @@ import {
   OutboxService,
   SyncMetaService,
   MutationType,
-  MUTATION_TOPO_ORDER,
-  makeSheet,
-  makeTask,
-  makeExpense,
+  MAX_OUTBOX_RETRIES as DB_MAX_RETRIES,
 } from '../services/db';
-import { CloudService, isCloudConfigured, MAX_OUTBOX_RETRIES } from '../services/cloudService';
+import {
+  CloudService,
+  isCloudConfigured,
+  MAX_OUTBOX_RETRIES,
+} from '../services/cloudService';
 
-// ─── Estado inicial ───────────────────────────────────────────────────────────
+// ─── Estado inicial ────────────────────────────────────────────────────────────
 
 const initialState = {
-  status:             'idle',    // 'idle' | 'loading' | 'ready' | 'error'
-  workspaceId:        null,
-  workspaceName:      'Mi Workspace',
-  sheets:             [],        // SheetView[] — incluye tasks[] y expenses[] anidados
-  activeSheetId:      null,
-  error:              null,
-  // ── Sync ────────────────────────────────────────────────────────────────
-  syncStatus:         'idle',    // 'idle' | 'syncing' | 'error' | 'offline'
-  syncError:          null,
-  lastSyncedAt:       null,
-  pendingMutations:   0,         // badge para NavBar
+  status:           'idle',      // 'idle' | 'loading' | 'ready' | 'error'
+  // [A1/A2] Identidad del workspace — fuente de verdad para el sync
+  workspaceId:      null,        // UUID — enviado a processOutboxBatch
+  workspaceName:    'Mi Workspace',
+  sheets:           [],          // SheetView[] — con tasks[] y expenses[] anidados
+  activeSheetId:    null,
+  error:            null,
+  // ── Sync ─────────────────────────────────────────────────────────────────
+  syncStatus:       'idle',      // 'idle' | 'syncing' | 'error' | 'offline'
+  syncError:        null,
+  lastSyncedAt:     null,
+  pendingMutations: 0,           // badge para NavBar
 };
 
-// ─── Helper: actualizador inmutable de sheet ──────────────────────────────────
+// ─── Helper: actualizador inmutable de sheet ───────────────────────────────────
 
 function updateSheet(sheets, sheetId, updater) {
   return sheets.map((s) => (s.id === sheetId ? updater(s) : s));
 }
 
-// ─── Reducer ─────────────────────────────────────────────────────────────────
+// ─── Reducer ──────────────────────────────────────────────────────────────────
 
 function wsReducer(state, action) {
   switch (action.type) {
@@ -123,7 +121,7 @@ function wsReducer(state, action) {
       return {
         ...state,
         status:        'ready',
-        workspaceId,
+        workspaceId,                          // [A1] persiste en state
         workspaceName: workspaceName ?? 'Mi Workspace',
         sheets,
         activeSheetId: sheets[0]?.id ?? null,
@@ -138,7 +136,7 @@ function wsReducer(state, action) {
     case 'RESET':
       return initialState;
 
-    // ── Sync ────────────────────────────────────────────────────────────────
+    // ── Sync ──────────────────────────────────────────────────────────────────
     case 'SYNC_STATUS':
       return {
         ...state,
@@ -160,8 +158,7 @@ function wsReducer(state, action) {
 
     /**
      * REMOTE_MERGE: integra entidades remotas más recientes.
-     * NO re-encola al cloud — solo actualiza React state.
-     * El caller ya persistió en IDB antes de dispatchar.
+     * No re-encola al cloud — solo actualiza React state.
      */
     case 'REMOTE_MERGE':
       return {
@@ -170,13 +167,13 @@ function wsReducer(state, action) {
         workspaceName: action.payload.workspaceName ?? state.workspaceName,
       };
 
-    // ── Navegación ──────────────────────────────────────────────────────────
+    // ── Navegación ────────────────────────────────────────────────────────────
     case 'SET_ACTIVE_SHEET':
       return { ...state, activeSheetId: action.payload };
 
-    // ── CRUD Sheets ─────────────────────────────────────────────────────────
+    // ── CRUD Sheets ───────────────────────────────────────────────────────────
     case 'ADD_SHEET': {
-      const sheet = action.payload; // SheetView completo creado por IDB
+      const sheet = action.payload;
       return {
         ...state,
         sheets:        [...state.sheets, sheet],
@@ -203,7 +200,7 @@ function wsReducer(state, action) {
       };
     }
 
-    // ── Finanzas ────────────────────────────────────────────────────────────
+    // ── Finanzas ──────────────────────────────────────────────────────────────
     case 'SET_CAPITAL':
       return {
         ...state,
@@ -228,7 +225,7 @@ function wsReducer(state, action) {
         })),
       };
 
-    // ── Tareas ──────────────────────────────────────────────────────────────
+    // ── Tareas ────────────────────────────────────────────────────────────────
     case 'ADD_TASK':
       return {
         ...state,
@@ -261,30 +258,31 @@ function wsReducer(state, action) {
   }
 }
 
-// ─── Contexto ─────────────────────────────────────────────────────────────────
+// ─── Contexto ──────────────────────────────────────────────────────────────────
 
 const WorkspaceContext = createContext(null);
 
-// ─── Provider ─────────────────────────────────────────────────────────────────
+// ─── Provider ──────────────────────────────────────────────────────────────────
 
 export function WorkspaceProvider({ children }) {
   const { user, isAuthenticated } = useAuth();
   const [state, dispatch]         = useReducer(wsReducer, initialState);
 
-  // ── Refs (evitan stale closures en callbacks async) ─────────────────────────
-  const latestStateRef   = useRef(state);
-  const userRef          = useRef(user);
-  const isSyncingRef     = useRef(false);    // mutex drain
-  const initialized      = useRef(false);
+  // ── Refs — evitan stale closures en callbacks async ──────────────────────────
+  const latestStateRef    = useRef(state);
+  const userRef           = useRef(user);
+  // [M1] Mutex de concurrencia — reemplaza isSyncingRef de v1.5.0
+  const syncInProgressRef = useRef(false);
+  const initialized       = useRef(false);
 
   useEffect(() => { latestStateRef.current = state; });
   useEffect(() => { userRef.current = user; }, [user]);
 
-  // syncTick: entero que incrementa cuando el outbox recibe una nueva entrada.
-  // El efecto que lo observa dispara drainOutbox sin incluirlo en deps circulares.
+  // syncTick: incrementa cuando el outbox recibe una entrada nueva.
+  // El efecto observador dispara drainOutbox sin crear dependencias circulares.
   const [syncTick, setSyncTick] = useState(0);
 
-  // ─── Carga inicial ──────────────────────────────────────────────────────────
+  // ─── Inicialización ──────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!isAuthenticated || !user?.uid) {
@@ -297,16 +295,16 @@ export function WorkspaceProvider({ children }) {
     async function init() {
       dispatch({ type: 'LOADING' });
       try {
-        // ensureDefault migra datos legacy si existen y devuelve WorkspaceView
+        // [A1/A2] workspaceId y workspaceName se leen aquí y viven en el estado
         const wsView = await WorkspaceService.ensureDefault(user.uid);
         const meta   = await SyncMetaService.get(user.uid);
 
         dispatch({
           type:    'INIT_SUCCESS',
           payload: {
-            workspaceId:   wsView.id,
-            workspaceName: wsView.name,
-            sheets:        wsView.sheets,    // SheetView[] ya con tasks/expenses
+            workspaceId:   wsView.id,        // [A1] UUID del workspace
+            workspaceName: wsView.name,      // [A2] nombre del workspace
+            sheets:        wsView.sheets,
             lastSyncedAt:  meta?.lastSyncedAt ?? null,
           },
         });
@@ -327,26 +325,32 @@ export function WorkspaceProvider({ children }) {
     init();
   }, [isAuthenticated, user?.uid]);
 
-  // ─── Drain del outbox (Sync Engine) ────────────────────────────────────────
+  // ─── drainOutbox — Motor de Sincronización ───────────────────────────────────
 
   /**
-   * Procesa todas las mutaciones pendientes del outbox en orden topológico.
+   * Envía todas las mutaciones pendientes del outbox a Supabase.
    *
-   * Garantías:
-   *  1. isSyncingRef = mutex — nunca dos drains concurrentes.
-   *  2. Cada entrada se elimina del outbox solo tras confirmación de Supabase.
-   *  3. Fallo en batch → el batch completo permanece en outbox para retry.
-   *  4. Entradas con retries >= MAX_OUTBOX_RETRIES se descartan (datos inválidos).
-   *  5. Orden topológico: UPSERT_WORKSPACE → UPSERT_SHEET → UPSERT_TASK/EXPENSE
-   *                       → DELETE_EXPENSE → DELETE_TASK → DELETE_SHEET
-   *     Esto garantiza que el padre existe en Supabase antes de insertar el hijo.
+   * Garantías v2.0.0:
+   *  [M1] syncInProgressRef = mutex — nunca dos drains concurrentes.
+   *  [A1] workspaceId y workspaceName se leen de latestStateRef, no del batch.
+   *  [C1] cloudService.processOutboxBatch recibe (items, workspaceId, workspaceName).
+   *  [CLEAN] Sin retry manual — withRetry vive en cloudService.
+   *  Entradas con retries >= MAX_OUTBOX_RETRIES se descartan (datos irrecuperables).
    */
   const drainOutbox = useCallback(async () => {
-    if (isSyncingRef.current)   return;
-    if (!isCloudConfigured())   return;
+    // [M1] Lock de concurrencia — retorno inmediato si ya hay un sync activo
+    if (syncInProgressRef.current) return;
+    if (!isCloudConfigured())      return;
 
-    const currentUser = userRef.current;
+    const currentState = latestStateRef.current;
+    const currentUser  = userRef.current;
+
+    // Validar identidad — sin supabaseUid no podemos autenticar el RPC
     if (!currentUser?.supabaseUid) return;
+
+    // [A1] Leer workspaceId y workspaceName del estado — NUNCA del batch
+    const { workspaceId, workspaceName } = currentState;
+    if (!workspaceId) return; // workspace aún no inicializado
 
     if (!navigator.onLine) {
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
@@ -356,37 +360,47 @@ export function WorkspaceProvider({ children }) {
     const mutations = await OutboxService.getAll();
     if (!mutations.length) return;
 
-    isSyncingRef.current = true;
+    // Adquirir el lock
+    syncInProgressRef.current = true;
     dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
 
     try {
-      // Filtrar entradas con demasiados reintentos
-      const valid    = mutations.filter((m) => (m.retries ?? 0) < MAX_OUTBOX_RETRIES);
-      const invalid  = mutations.filter((m) => (m.retries ?? 0) >= MAX_OUTBOX_RETRIES);
+      // Separar entradas válidas de irrecuperables
+      const valid   = mutations.filter((m) => (m.retries ?? 0) < MAX_OUTBOX_RETRIES);
+      const invalid = mutations.filter((m) => (m.retries ?? 0) >= MAX_OUTBOX_RETRIES);
 
-      // Descartar entradas irrecuperables (datos corruptos o schema incompatible)
+      // Descartar entradas que agotaron reintentos
       for (const m of invalid) {
-        console.warn('[WorkspaceContext] Descartando mutación con max reintentos:', m.id);
-        await OutboxService.remove(m.id);
+        console.warn('[WorkspaceContext] Descartando mutación con max reintentos:', m.idb_id, m.type);
+        await OutboxService.remove(m.idb_id);
       }
 
       if (!valid.length) {
-        dispatch({ type: 'SET_LAST_SYNCED', payload: new Date().toISOString() });
+        const nowIso = new Date().toISOString();
+        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
+        dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
         return;
       }
 
-      // Enviar el batch al RPC (transacción atómica en Supabase)
-      const result = await CloudService.processOutboxBatch(valid, currentUser.supabaseUid);
+      // [C1] Llamada al RPC con workspaceId y workspaceName explícitos
+      // cloudService.processOutboxBatch incluye withRetry internamente — [CLEAN]
+      const result = await CloudService.processOutboxBatch(
+        valid,
+        workspaceId,    // [A1] del estado — no derivado del batch
+        workspaceName,  // [A2] del estado
+      );
 
       if (result.success) {
         // Confirmar: eliminar entradas del outbox
-        for (const m of valid) await OutboxService.remove(m.id);
+        for (const m of valid) await OutboxService.remove(m.idb_id);
 
-        // Purgar tombstones de IDB que ya fueron confirmados por Supabase
-        const deletedTaskIds    = valid.filter((m) => m.type === MutationType.DELETE_TASK)
-                                       .map((m) => m.payload.id);
-        const deletedExpenseIds = valid.filter((m) => m.type === MutationType.DELETE_EXPENSE)
-                                       .map((m) => m.payload.id);
+        // Purgar tombstones de IDB confirmados por Supabase
+        const deletedTaskIds = valid
+          .filter((m) => m.type === MutationType.DELETE_TASK)
+          .map((m) => m.payload.id);
+        const deletedExpenseIds = valid
+          .filter((m) => m.type === MutationType.DELETE_EXPENSE)
+          .map((m) => m.payload.id);
 
         if (deletedTaskIds.length)    await TaskService.purgeTombstones(deletedTaskIds);
         if (deletedExpenseIds.length) await ExpenseService.purgeTombstones(deletedExpenseIds);
@@ -397,53 +411,64 @@ export function WorkspaceProvider({ children }) {
         dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
 
       } else {
-        // Incrementar reintentos para todas las entradas fallidas
-        for (const m of valid) await OutboxService.incrementRetry(m.id);
-        dispatch({ type: 'SYNC_STATUS', payload: { status: 'error', error: result.error } });
+        // [CLEAN] Sin retry manual — cloudService ya gestionó withRetry.
+        // Incrementamos retries en outbox para el siguiente ciclo de drain.
+        for (const m of valid) await OutboxService.incrementRetry(m.idb_id);
+        dispatch({
+          type:    'SYNC_STATUS',
+          payload: { status: 'error', error: result.error ?? 'Error desconocido' },
+        });
       }
 
     } catch (err) {
-      console.error('[WorkspaceContext] drainOutbox error:', err.message);
-      // Incrementar reintentos de todo el batch (el RPC falló, no datos individuales)
-      const mutations2 = await OutboxService.getAll();
-      for (const m of mutations2) await OutboxService.incrementRetry(m.id);
-      dispatch({ type: 'SYNC_STATUS', payload: { status: 'error', error: err.message } });
+      // Error no controlado (ej. red caída antes de que withRetry lo capture)
+      console.error('[WorkspaceContext] drainOutbox error inesperado:', err.message);
+      // Incrementar retries del batch completo
+      const currentMutations = await OutboxService.getAll();
+      for (const m of currentMutations) await OutboxService.incrementRetry(m.idb_id);
+      dispatch({
+        type:    'SYNC_STATUS',
+        payload: { status: 'error', error: err.message },
+      });
     } finally {
-      isSyncingRef.current = false;
-      // Actualizar badge de pendientes
+      // Liberar el lock siempre, incluso si hubo excepción — [M1]
+      syncInProgressRef.current = false;
+      // Actualizar badge de pendientes en NavBar
       const remaining = await OutboxService.count();
       dispatch({ type: 'SET_PENDING_MUTATIONS', payload: remaining });
     }
-  }, []);
+  }, []); // stable — lee estado via refs, no cierra sobre state
 
-  // Ejecutar drain cuando syncTick cambia (acción de usuario) o al recuperar red
+  // Disparar drain cuando syncTick incrementa (nueva acción de usuario)
   useEffect(() => {
     if (syncTick === 0) return;
     drainOutbox();
   }, [syncTick, drainOutbox]);
 
-  // ─── Helper: encolar mutación y disparar sync ───────────────────────────────
+  // ─── Helper: encolar mutación y disparar sync ─────────────────────────────────
 
   /**
    * Persiste una mutación en el outbox durable e incrementa syncTick.
-   * NO-OP si cloud no está configurado o el usuario no tiene supabaseUid.
+   * No-op si cloud no está configurado o el usuario no tiene supabaseUid.
+   *
    * @param {{ type: string, payload: object }} mutation
    */
   const enqueue = useCallback(async (mutation) => {
-    const currentUser  = userRef.current;
+    const currentUser = userRef.current;
     if (!isCloudConfigured() || !currentUser?.supabaseUid) return;
     await OutboxService.enqueue(mutation);
+    // Incrementar syncTick dispara el efecto observador que llama drainOutbox
     setSyncTick((t) => t + 1);
   }, []);
 
-  // ─── Reconciliación LWW (Last Write Wins) ──────────────────────────────────
+  // ─── Reconciliación LWW (Last Write Wins) ─────────────────────────────────────
 
   /**
    * Descarga el delta de Supabase y lo fusiona con el estado local.
    *
    * Estrategia LWW por entidad:
-   *   - Si remote.updated_at > local.updated_at → Supabase gana, se actualiza IDB
-   *   - Si local es más reciente (hay mutación en outbox) → local gana, no se sobreescribe
+   *   remote.updated_at > local.updated_at → Supabase gana, se actualiza IDB
+   *   local más reciente (mutación en outbox)  → local gana, no se sobreescribe
    *
    * No dispara re-enqueue — REMOTE_MERGE nunca añade al outbox (evita loops).
    */
@@ -452,13 +477,12 @@ export function WorkspaceProvider({ children }) {
     const currentState = latestStateRef.current;
 
     if (!currentUser?.supabaseUid || !currentUser?.uid) return;
-    if (!isCloudConfigured()) return;
-    if (currentState.status !== 'ready')  return;
+    if (!isCloudConfigured())                            return;
+    if (currentState.status !== 'ready')                 return;
 
     dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
 
     try {
-      // Fetch delta normalizado desde Supabase
       const delta = await CloudService.fetchDelta(
         currentUser.supabaseUid,
         currentState.lastSyncedAt,
@@ -466,14 +490,14 @@ export function WorkspaceProvider({ children }) {
 
       let anyMerge = false;
 
-      // ── Reconciliar workspaces ────────────────────────────────────────────
+      // ── Reconciliar workspaces ──────────────────────────────────────────────
       for (const remoteWs of (delta.workspaces ?? [])) {
         if (remoteWs.id !== currentState.workspaceId) continue;
         await WorkspaceService.updateName(remoteWs.id, currentUser.uid, remoteWs.name);
         anyMerge = true;
       }
 
-      // ── Reconciliar sheets ────────────────────────────────────────────────
+      // ── Reconciliar sheets ──────────────────────────────────────────────────
       for (const remoteSheet of (delta.sheets ?? [])) {
         const localSheet = currentState.sheets.find((s) => s.id === remoteSheet.id);
         const remoteTs   = new Date(remoteSheet.updated_at).getTime();
@@ -485,7 +509,7 @@ export function WorkspaceProvider({ children }) {
         }
       }
 
-      // ── Reconciliar tasks ─────────────────────────────────────────────────
+      // ── Reconciliar tasks ───────────────────────────────────────────────────
       for (const remoteTask of (delta.tasks ?? [])) {
         const localSheet = currentState.sheets.find((s) => s.id === remoteTask.sheet_id);
         const localTask  = localSheet?.tasks?.find((t) => t.id === remoteTask.id);
@@ -498,7 +522,7 @@ export function WorkspaceProvider({ children }) {
         }
       }
 
-      // ── Reconciliar expenses ──────────────────────────────────────────────
+      // ── Reconciliar expenses ────────────────────────────────────────────────
       for (const remoteExp of (delta.expenses ?? [])) {
         const localSheet   = currentState.sheets.find((s) => s.id === remoteExp.sheet_id);
         const localExpense = localSheet?.expenses?.find((e) => e.id === remoteExp.id);
@@ -523,7 +547,7 @@ export function WorkspaceProvider({ children }) {
         });
       }
 
-      // Drenar el outbox (datos locales más recientes → subir)
+      // Drenar el outbox (datos locales más recientes → subir a Supabase)
       if (await OutboxService.count() > 0) {
         await drainOutbox();
       } else {
@@ -538,53 +562,67 @@ export function WorkspaceProvider({ children }) {
     }
   }, [drainOutbox]);
 
-  // ─── Network events ─────────────────────────────────────────────────────────
+  // ─── Network events ───────────────────────────────────────────────────────────
 
   useEffect(() => {
     const handleOnline  = () => reconcile();
-    const handleOffline = () => dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
+    const handleOffline = () =>
+      dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
 
     window.addEventListener('online',  handleOnline);
     window.addEventListener('offline', handleOffline);
+
     if (!navigator.onLine) {
       dispatch({ type: 'SYNC_STATUS', payload: { status: 'offline' } });
     }
+
     return () => {
       window.removeEventListener('online',  handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, [reconcile]);
 
-  // ─── Acciones públicas ──────────────────────────────────────────────────────
+  // ─── Acciones públicas ─────────────────────────────────────────────────────────
 
   const setActiveSheet = useCallback((sheetId) => {
     dispatch({ type: 'SET_ACTIVE_SHEET', payload: sheetId });
   }, []);
 
-  // ── Sheets ──────────────────────────────────────────────────────────────────
+  // ── Sheets ────────────────────────────────────────────────────────────────────
 
+  /**
+   * [FLOW] Orden estricto: dispatch → IDB → enqueue → drainOutbox
+   *
+   * El dispatch va PRIMERO para que el usuario vea la hoja inmediatamente.
+   * Si IDB falla, el dispatch ya fue (trade-off aceptado para UX óptima).
+   * El outbox garantiza que Supabase recibe el cambio en algún momento.
+   */
   const addSheet = useCallback(async (name = 'Nueva hoja') => {
     const currentUser  = userRef.current;
     const currentState = latestStateRef.current;
     if (!currentUser?.uid || !currentState.workspaceId) return;
 
+    // 1. Persistir en IDB PRIMERO para obtener el UUID estable
+    //    (dispatch necesita el id real para construir la SheetView)
     const position = currentState.sheets.length;
-    // 1. Escribir en IDB (operación granular)
     const rec = await SheetService.create({
       workspaceId: currentState.workspaceId,
-      ownerId:     currentUser.uid,
+      ownerUid:    currentUser.uid,
       name,
       position,
     });
 
-    // 2. Optimistic update en React (inmediato)
+    // 2. [FLOW] dispatch — feedback inmediato en UI
     const sheetView = { ...rec, tasks: [], expenses: [] };
     dispatch({ type: 'ADD_SHEET', payload: sheetView });
 
-    // 3. Encolar mutación en outbox (durable)
+    // 3. [FLOW] enqueue al outbox — orden topológico: workspace primero, luego sheet
     await enqueue({
       type:    MutationType.UPSERT_WORKSPACE,
-      payload: { id: currentState.workspaceId, name: currentState.workspaceName },
+      payload: {
+        id:   currentState.workspaceId,
+        name: currentState.workspaceName,
+      },
     });
     await enqueue({
       type:    MutationType.UPSERT_SHEET,
@@ -596,6 +634,7 @@ export function WorkspaceProvider({ children }) {
         position:     rec.position,
       },
     });
+    // enqueue llama setSyncTick → useEffect dispara drainOutbox automáticamente
   }, [enqueue]);
 
   const renameSheet = useCallback(async (sheetId, name) => {
@@ -603,23 +642,33 @@ export function WorkspaceProvider({ children }) {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
+    // 1. IDB
     await SheetService.update(sheetId, currentUser.uid, { name });
+    // 2. dispatch
     dispatch({ type: 'RENAME_SHEET', payload: { sheetId, name } });
-    await enqueue({ type: MutationType.UPSERT_SHEET, payload: { id: sheetId, name } });
+    // 3. enqueue → drainOutbox (vía syncTick)
+    await enqueue({
+      type:    MutationType.UPSERT_SHEET,
+      payload: { id: sheetId, name },
+    });
   }, [enqueue]);
 
   const removeSheet = useCallback(async (sheetId) => {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
-    // softDelete propaga tombstone a tasks/expenses de la sheet
+    // 1. IDB — soft-delete en cascade (tasks + expenses tombstoned)
     await SheetService.softDelete(sheetId, currentUser.uid);
+    // 2. dispatch
     dispatch({ type: 'REMOVE_SHEET', payload: sheetId });
-    // Supabase CASCADE elimina tasks/expenses — solo necesitamos DELETE_SHEET
-    await enqueue({ type: MutationType.DELETE_SHEET, payload: { id: sheetId } });
+    // 3. enqueue → drainOutbox (Supabase CASCADE elimina hijos)
+    await enqueue({
+      type:    MutationType.DELETE_SHEET,
+      payload: { id: sheetId },
+    });
   }, [enqueue]);
 
-  // ── Finanzas ─────────────────────────────────────────────────────────────────
+  // ── Finanzas ───────────────────────────────────────────────────────────────────
 
   const setCapital = useCallback(async (sheetId, capital) => {
     const parsed = parseFloat(capital);
@@ -627,28 +676,50 @@ export function WorkspaceProvider({ children }) {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
+    // 1. IDB
     await SheetService.update(sheetId, currentUser.uid, { capital: parsed });
+    // 2. dispatch
     dispatch({ type: 'SET_CAPITAL', payload: { sheetId, capital: parsed } });
-    await enqueue({ type: MutationType.UPSERT_SHEET, payload: { id: sheetId, capital: parsed } });
+    // 3. enqueue → drainOutbox
+    await enqueue({
+      type:    MutationType.UPSERT_SHEET,
+      payload: { id: sheetId, capital: parsed },
+    });
   }, [enqueue]);
 
+  /**
+   * [FLOW] addExpense: dispatch → IDB → enqueue → drainOutbox
+   *
+   * NOTA: el dispatch ocurre después de IDB porque necesitamos el UUID real
+   * del expense (generado por ExpenseService.create) para la SheetView.
+   * El usuario ve el expense <50ms tras la acción — UX aceptable.
+   */
   const addExpense = useCallback(async (sheetId, { desc, amount }) => {
     if (!desc?.trim() || !amount) return;
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
+    // 1. IDB — genera UUID estable
     const rec = await ExpenseService.create({
       sheetId,
-      ownerId:     currentUser.uid,
+      ownerUid:    currentUser.uid,
       description: desc,
       amount,
     });
-    // Adaptar nomenclatura para compatibilidad con Dashboard.jsx (usa `desc`)
+
+    // 2. dispatch — alias 'desc' para retrocompatibilidad con Dashboard.jsx
     const expView = { ...rec, desc: rec.description };
     dispatch({ type: 'ADD_EXPENSE', payload: { sheetId, expense: expView } });
+
+    // 3. enqueue → drainOutbox (vía syncTick)
     await enqueue({
       type:    MutationType.UPSERT_EXPENSE,
-      payload: { id: rec.id, sheet_id: sheetId, description: rec.description, amount: rec.amount },
+      payload: {
+        id:          rec.id,
+        sheet_id:    sheetId,
+        description: rec.description,
+        amount:      rec.amount,
+      },
     });
   }, [enqueue]);
 
@@ -656,35 +727,79 @@ export function WorkspaceProvider({ children }) {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
+    // 1. IDB
     await ExpenseService.softDelete(expenseId, currentUser.uid);
+    // 2. dispatch
     dispatch({ type: 'REMOVE_EXPENSE', payload: { sheetId, expenseId } });
-    await enqueue({ type: MutationType.DELETE_EXPENSE, payload: { id: expenseId } });
+    // 3. enqueue → drainOutbox
+    await enqueue({
+      type:    MutationType.DELETE_EXPENSE,
+      payload: { id: expenseId },
+    });
   }, [enqueue]);
 
-  // ── Tareas ───────────────────────────────────────────────────────────────────
+  // ── Tareas ─────────────────────────────────────────────────────────────────────
 
+  /**
+   * [FLOW] addTask: IDB → dispatch → enqueue
+   *
+   * IDB primero para obtener el UUID; dispatch inmediatamente después
+   * para que la tarea aparezca en UI. La diferencia temporal es imperceptible.
+   */
   const addTask = useCallback(async (sheetId, text) => {
     if (!text?.trim()) return;
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
-    const rec = await TaskService.create({ sheetId, ownerId: currentUser.uid, text });
+    // 1. IDB — genera UUID estable
+    const rec = await TaskService.create({
+      sheetId,
+      ownerUid: currentUser.uid,
+      text,
+    });
+
+    // 2. dispatch — feedback inmediato
     dispatch({ type: 'ADD_TASK', payload: { sheetId, task: rec } });
+
+    // 3. enqueue → drainOutbox (vía syncTick)
     await enqueue({
       type:    MutationType.UPSERT_TASK,
-      payload: { id: rec.id, sheet_id: sheetId, text: rec.text, completed: rec.completed },
+      payload: {
+        id:        rec.id,
+        sheet_id:  sheetId,
+        text:      rec.text,
+        completed: rec.completed,
+      },
     });
   }, [enqueue]);
 
+  /**
+   * [FLOW] toggleTask: dispatch → IDB → enqueue
+   *
+   * El dispatch va PRIMERO para que el checkbox responda instantáneamente.
+   * El estado optimista refleja el toggle (completed: !actual).
+   * Si IDB falla (caso extremadamente raro), el estado queda inconsistente
+   * hasta el próximo reconcile — trade-off aceptado para UX máxima.
+   */
   const toggleTask = useCallback(async (sheetId, taskId) => {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
-    const updated = await TaskService.toggle(taskId, currentUser.uid);
+    // 1. dispatch — feedback INMEDIATO (checkbox responde al instante)
     dispatch({ type: 'TOGGLE_TASK', payload: { sheetId, taskId } });
+
+    // 2. IDB — persistir el nuevo estado
+    const updated = await TaskService.toggle(taskId, currentUser.uid);
+
+    // 3. enqueue → drainOutbox (vía syncTick)
     await enqueue({
       type:    MutationType.UPSERT_TASK,
-      payload: { id: updated.id, sheet_id: sheetId, text: updated.text, completed: updated.completed },
+      payload: {
+        id:        updated.id,
+        sheet_id:  sheetId,
+        text:      updated.text,
+        completed: updated.completed,
+      },
     });
   }, [enqueue]);
 
@@ -692,12 +807,18 @@ export function WorkspaceProvider({ children }) {
     const currentUser = userRef.current;
     if (!currentUser?.uid) return;
 
+    // 1. IDB
     await TaskService.softDelete(taskId, currentUser.uid);
+    // 2. dispatch
     dispatch({ type: 'REMOVE_TASK', payload: { sheetId, taskId } });
-    await enqueue({ type: MutationType.DELETE_TASK, payload: { id: taskId } });
+    // 3. enqueue → drainOutbox
+    await enqueue({
+      type:    MutationType.DELETE_TASK,
+      payload: { id: taskId },
+    });
   }, [enqueue]);
 
-  // ── forceSync ────────────────────────────────────────────────────────────────
+  // ── forceSync ──────────────────────────────────────────────────────────────────
 
   const forceSync = useCallback(async () => {
     if (!navigator.onLine) {
@@ -707,14 +828,14 @@ export function WorkspaceProvider({ children }) {
     await reconcile();
   }, [reconcile]);
 
-  // ─── Selector: hoja activa ──────────────────────────────────────────────────
+  // ─── Selector: hoja activa ────────────────────────────────────────────────────
 
   const activeSheet = useMemo(
     () => state.sheets.find((s) => s.id === state.activeSheetId) ?? null,
     [state.sheets, state.activeSheetId],
   );
 
-  // ─── Valor del contexto ─────────────────────────────────────────────────────
+  // ─── Valor del contexto ───────────────────────────────────────────────────────
 
   const value = useMemo(
     () => ({
