@@ -377,16 +377,26 @@ function sanitizeExpense(expense, expectedSheetId) {
  * @param {string} workspaceName
  * @returns {{ id: string, name: string }}
  */
-function sanitizeWorkspace(workspaceId, workspaceName) {
+function sanitizeWorkspace(workspaceId, workspaceName, ownerUid) {
   const id   = String(workspaceId ?? '').trim();
   const name = String(workspaceName ?? 'Mi Workspace').trim() || 'Mi Workspace';
+  const owner_uid = String(ownerUid ?? '').trim();
+  
   if (!id) throw new CloudServiceError(
     'workspaceId es obligatorio para el RPC batch_sync_workspace',
     'INVALID_ARGS',
     'workspaceId vacío o undefined',
-    false, // no reintentable — error de programación
+    false,
   );
-  return { id, name };
+  
+  if (!owner_uid) throw new CloudServiceError(
+    'ownerUid es obligatorio para el RPC batch_sync_workspace',
+    'INVALID_ARGS',
+    'ownerUid vacío o undefined',
+    false,
+  );
+  
+  return { id, owner_uid, name };
 }
 
 // ─── CloudService ─────────────────────────────────────────────────────────────
@@ -526,11 +536,11 @@ export const CloudService = {
    * @param {string}        workspaceName - Nombre actual del workspace
    * @returns {Promise<{ success: boolean, error?: string }>}
    */
-  async processOutboxBatch(items, workspaceId, workspaceName) {
+  async processOutboxBatch(items, workspaceId, workspaceName, ownerUid) {
     if (!items?.length) return { success: true };
 
-    // [C1] Garantizar workspace payload válido — lanza CloudServiceError si falta ID
-    const wsPayload = sanitizeWorkspace(workspaceId, workspaceName);
+    // [C1] Garantizar workspace payload válido — lanza CloudServiceError si falta ID o owner
+    const wsPayload = sanitizeWorkspace(workspaceId, workspaceName, ownerUid);
 
     // Acumuladores indexados por entity ID (idempotencia LWW local)
     const sheetsMap   = new Map();

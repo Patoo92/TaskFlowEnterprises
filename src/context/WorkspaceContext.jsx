@@ -424,6 +424,7 @@ export function WorkspaceProvider({ children }) {
         valid,
         workspaceId,    // [A1] del estado — no derivado del batch
         workspaceName,  // [A2] del estado
+        userRef.current?.uid,  // [CVE] ownerUid para el workspace en Supabase
       );
 
       // ✅ ARREGLO: separar lógica de remove con try-catch independiente
