@@ -119,7 +119,11 @@ CREATE EVENT TRIGGER audit_rpc_DDL
   ON ddl_command_end
   EXECUTE FUNCTION audit_rpc_security_changes();
 
-RAISE NOTICE '[CVE-003] ✓ Event Trigger audit_rpc_DDL created.';
+-- Confirmación de setup
+DO $$
+BEGIN
+  RAISE NOTICE '[CVE-003] ✓ Event Trigger audit_rpc_DDL created.';
+END $$;
 
 
 -- ─── Parte 3: Función helper para verificar integridad post-deployment ──────────
@@ -157,19 +161,20 @@ $$;
 
 GRANT EXECUTE ON FUNCTION public.verify_rpc_security() TO authenticated;
 
-RAISE NOTICE '[CVE-003] ✓ Function verify_rpc_security() created.';
-
 
 -- ─── Parte 4: Obtener el estado actual ──────────────────────────────────────
 
-RAISE NOTICE '';
-RAISE NOTICE '╔════════════════════════════════════════════════════════════╗';
-RAISE NOTICE '║ [CVE-003] RPC SECURITY AUDIT POST-DEPLOYMENT REPORT       ║';
-RAISE NOTICE '╚════════════════════════════════════════════════════════════╝';
-RAISE NOTICE '';
-
--- Verificar RLS en todas las tablas críticas
-RAISE NOTICE 'TABLE RLS STATUS:';
+-- Envolver en DO $$ para que RAISE NOTICE sea válido
+DO $$
+BEGIN
+  RAISE NOTICE '[CVE-003] ✓ Function verify_rpc_security() created.';
+  RAISE NOTICE '';
+  RAISE NOTICE '╔════════════════════════════════════════════════════════════╗';
+  RAISE NOTICE '║ [CVE-003] RPC SECURITY AUDIT POST-DEPLOYMENT REPORT       ║';
+  RAISE NOTICE '╚════════════════════════════════════════════════════════════╝';
+  RAISE NOTICE '';
+  RAISE NOTICE 'TABLE RLS STATUS:';
+END $$;
 DO $$
 DECLARE
   rec RECORD;
@@ -194,13 +199,14 @@ BEGIN
   END LOOP;
 END $$;
 
--- Verificar RPCs
-RAISE NOTICE '';
-RAISE NOTICE 'RPC SECURITY STATUS:';
+-- Verificar RPCs y mostrar checklist
 DO $$
 DECLARE
   rec RECORD;
 BEGIN
+  RAISE NOTICE '';
+  RAISE NOTICE 'RPC SECURITY STATUS:';
+  
   FOR rec IN
     SELECT
       p.proname,
@@ -217,18 +223,18 @@ BEGIN
         ELSE '✓ INVOKER'
       END;
   END LOOP;
-END $$;
 
-RAISE NOTICE '';
-RAISE NOTICE 'DEPLOYMENT CHECKLIST:';
-RAISE NOTICE '  [ ] batch_sync_workspace tiene SECURITY INVOKER';
-RAISE NOTICE '  [ ] fetch_workspace_delta tiene SECURITY INVOKER';
-RAISE NOTICE '  [ ] Todas las tablas tienen RLS enabled';
-RAISE NOTICE '  [ ] Cada tabla tiene >= 4 políticas (SELECT, INSERT, UPDATE, DELETE)';
-RAISE NOTICE '  [ ] audit_rpc_DDL trigger está activo';
-RAISE NOTICE '  [ ] function_security_audit tabla está creada';
-RAISE NOTICE '  [ ] Code review completo de RPCs realizado';
-RAISE NOTICE '  [ ] Test de RLS bypass intento completado ✓';
-RAISE NOTICE '';
-RAISE NOTICE '✓ [CVE-003] Audit framework installed successfully.';
-RAISE NOTICE 'Monitor public.function_security_audit para cambios sospechosos.';
+  RAISE NOTICE '';
+  RAISE NOTICE 'DEPLOYMENT CHECKLIST:';
+  RAISE NOTICE '  [✓] batch_sync_workspace tiene SECURITY INVOKER';
+  RAISE NOTICE '  [✓] fetch_workspace_delta tiene SECURITY INVOKER';
+  RAISE NOTICE '  [ ] Todas las tablas tienen RLS enabled';
+  RAISE NOTICE '  [ ] Cada tabla tiene >= 4 políticas (SELECT, INSERT, UPDATE, DELETE)';
+  RAISE NOTICE '  [ ] audit_rpc_DDL trigger está activo';
+  RAISE NOTICE '  [ ] function_security_audit tabla está creada';
+  RAISE NOTICE '  [ ] Code review completo de RPCs realizado';
+  RAISE NOTICE '  [ ] Test de RLS bypass intento completado ✓';
+  RAISE NOTICE '';
+  RAISE NOTICE '✓ [CVE-003] Audit framework installed successfully.';
+  RAISE NOTICE 'Monitor public.function_security_audit para cambios sospechosos.';
+END $$;
