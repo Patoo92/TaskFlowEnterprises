@@ -1222,6 +1222,62 @@ export const SyncMetaService = {
     await db.put('sync_meta', updated);
     return updated;
   },
+
+  /**
+   * [CVE-007] Obtener o crear workspace_id canónico.
+   * Garantiza que existe solo un workspace_id por usuario, incluso en multi-device.
+   * 
+   * @param {string} uid
+   * @returns {Promise<string>} UUID canonical workspace_id
+   */
+  async getOrCreateCanonicalWorkspaceId(uid) {
+    const meta = await this.get(uid);
+    
+    if (meta?.canonicalWorkspaceId) {
+      return meta.canonicalWorkspaceId;
+    }
+
+    // Crear UUID nuevo + persistir atómicamente
+    const wsId = crypto.randomUUID();
+    await this.upsert(uid, {
+      canonicalWorkspaceId: wsId,
+      workspaceIdLocked: true,
+      workspaceIdLockedAt: new Date().toISOString(),
+    });
+
+    return wsId;
+  },
+
+  /**
+   * [CVE-007] Detectar y registrar conflicto de workspace (multi-device).
+   * @param {string} uid
+   * @param {string} device1WorkspaceId
+   * @param {string} device2WorkspaceId
+   */
+  async recordWorkspaceConflict(uid, device1WorkspaceId, device2WorkspaceId) {
+    console.warn('[SyncMetaService] Workspace conflict detected:', {
+      device1: device1WorkspaceId,
+      device2: device2WorkspaceId,
+    });
+    await this.upsert(uid, {
+      workspaceConflictDetectedAt: new Date().toISOString(),
+      workspaceConflictNote: `Conflicto: Device1=${device1WorkspaceId}, Device2=${device2WorkspaceId}`,
+    });
+  },
+
+  /**
+   * [CVE-011] Obtener o crear device_id único para tie-breaker LWW.
+   * @param {string} uid
+   * @returns {Promise<string>}
+   */
+  async getOrCreateDeviceId(uid) {
+    const meta = await this.get(uid);
+    if (meta?.deviceId) return meta.deviceId;
+
+    const deviceId = `device_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await this.upsert(uid, { deviceId });
+    return deviceId;
+  },
 };
 
 // ─── Service: UserService ─────────────────────────────────────────────────────

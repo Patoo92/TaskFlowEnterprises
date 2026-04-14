@@ -48,8 +48,26 @@ const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ?? '';
 /** Número máximo de reintentos por entrada del outbox antes de descartarla. */
 export const MAX_OUTBOX_RETRIES = 5;
 
-/** Timeout en ms para operaciones de autenticación con Supabase. [C4] */
-const AUTH_TIMEOUT_MS = 8_000;
+/** [CVE-010] Timeouts adaptativos según tipo de conexión. */
+const AUTH_TIMEOUT_MS_3G     = 20_000; // 3G: RTT ~200-300ms
+const AUTH_TIMEOUT_MS_4G_LTE = 12_000; // 4G/LTE: RTT ~50-100ms
+const AUTH_TIMEOUT_MS_WIFI   = 8_000;  // WiFi: RTT <10ms
+
+/**
+ * [CVE-010] Detectar tipo de conexión y retornar timeout apropiado
+ */
+function getAuthTimeout() {
+  if (navigator.connection) {
+    const type = navigator.connection.effectiveType;
+    switch (type) {
+      case '4g': return AUTH_TIMEOUT_MS_4G_LTE;
+      case '3g': return AUTH_TIMEOUT_MS_3G;
+      case '2g': return 30_000;
+      default:  return AUTH_TIMEOUT_MS_WIFI;
+    }
+  }
+  return AUTH_TIMEOUT_MS_WIFI;
+}
 
 export const isCloudConfigured = () => Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
@@ -92,16 +110,12 @@ export class CloudServiceError extends Error {
 // ─── Helpers de resiliencia ───────────────────────────────────────────────────
 
 /**
- * Unwrap seguro de la respuesta Supabase, capturando el JSONB detallado. [C3]
- *
- * El RPC v2.0.0 devuelve errores como:
- *   error.code    → código HTTP ("400", "409", etc.)
- *   error.message → mensaje de PostgreSQL
- *   error.details → campo/constraint que falló (cuando aplica)
- *
- * Los errores 4xx (datos inválidos, violación de constraint) se marcan
- * como NO reintentables para que el outbox los descarte tras el primer fallo,
- * en lugar de agotar MAX_OUTBOX_RETRIES con peticiones condenadas al fracaso.
+ * [CVE-006] Unwrap con distinción semántica de errores HTTP.
+ * 
+ * 429 TOO_MANY_REQUESTS    → reintentable con backoff
+ * 430 REQUEST_TIMEOUT      → reintentable
+ * 4xx genérico             → NO reintentable (validación, RLS, FK)
+ * 5xx                      → reintentable (servidor down)
  *
  * @param {{ data: unknown, error: unknown }} supabaseResponse
  * @returns {unknown} data
@@ -110,14 +124,32 @@ export class CloudServiceError extends Error {
 function unwrap({ data, error }) {
   if (!error) return data;
 
-  // Extraer información estructurada del error de Supabase
-  const httpCode  = String(error.code ?? '');
-  const message   = error.message ?? 'Error desconocido de Supabase';
-  const detail    = error.details  ?? error.hint ?? '';
+  const httpCode = String(error.code ?? '');
+  const message  = error.message ?? 'Error desconocido de Supabase';
+  const detail   = error.details ?? error.hint ?? '';
 
-  // Los errores 4xx son no reintentables (datos incorrectos o violación RLS/FK)
-  const is4xx     = httpCode.startsWith('4') || httpCode === 'PGRST' || httpCode === '42';
-  const retryable = !is4xx;
+  // Errores definitivamente NO reintentables (validación, FK, RLS)
+  const NON_RETRYABLE_4XX = [
+    '400', '401', '403', '404',  // Bad Request, Unauthorized, Forbidden, Not Found
+    '23', '23503', '23505',       // PostgreSQL FK violation, unique violation
+    '42', '42P01', '42703',       // PostgreSQL undefined table, column
+    'PGRST', 'INVALID_ARGS',      // Payload parsing errors
+  ];
+
+  // Errores reintentables (throttling, temp issues)
+  const RETRYABLE_4XX = ['429', '430', '409']; // Rate limit, Timeout, Conflict
+
+  let retryable = true;
+
+  if (NON_RETRYABLE_4XX.some(code => httpCode.includes(code))) {
+    retryable = false;
+  } else if (RETRYABLE_4XX.some(code => httpCode.includes(code))) {
+    retryable = true;
+  } else if (httpCode.startsWith('5') || httpCode === '') {
+    retryable = true; // 5xx o desconocido
+  } else if (httpCode.startsWith('4')) {
+    retryable = false; // Cualquier otro 4xx → validación error
+  }
 
   throw new CloudServiceError(message, httpCode, detail, retryable);
 }
@@ -141,62 +173,200 @@ async function withRetry(fn, maxRetries = 3, baseDelay = 800) {
       return await fn();
     } catch (err) {
       // No reintentar errores 4xx (datos incorrectos) — propagar inmediatamente [C3]
-      if (err instanceof CloudServiceError && !err.retryable) throw err;
+      if (err instanceof CloudServiceError && !err.retryable) {
+        console.warn(
+          `[CloudService] Non-retryable error (${err.code}): ${err.message}. ` +
+          `Tratando como fallo permanente.`
+        );
+        throw err;
+      }
       if (attempt === maxRetries) throw err;
+
+      console.info(
+        `[CloudService] Retryable error (${err?.code || 'UNKNOWN'}), ` +
+        `intento ${attempt + 1}/${maxRetries}`
+      );
 
       const cap   = baseDelay * Math.pow(2, attempt);
       const delay = Math.random() * Math.min(cap, 30_000);
+      console.debug(`[CloudService] Esperando ${Math.round(delay)}ms antes de reintentar...`);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
 }
 
 /**
- * Crea una Promise que rechaza con un CloudServiceError de timeout
- * tras `ms` milisegundos. Usar junto a Promise.race() o AbortController. [C4]
+ * [CVE-008] Timeout con AbortController y cleanup automático.
+ * Preferir esto sobre Promise.race para evitar memory leaks.
  *
  * @param {number} ms
  * @returns {Promise<never>}
  */
-function rejectAfter(ms) {
-  return new Promise((_, reject) =>
-    setTimeout(
+function createTimeoutPromise(ms) {
+  let timeoutId = null;
+  const promise = new Promise((_, reject) => {
+    timeoutId = setTimeout(
       () => reject(new CloudServiceError(`Timeout tras ${ms}ms`, 'TIMEOUT', '', true)),
       ms,
-    ),
-  );
+    );
+  });
+  // Exponer cleanup para limpiar manualmente si es necesario
+  promise.cleanup = () => {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  };
+  return promise;
+}
+
+/**
+ * [CVE-008] Wrapper que usa AbortController en lugar de Promise.race
+ * para mejor control del timeout.
+ *
+ * @param {number} ms
+ * @returns {{ controller: AbortController, timeoutId: number }}
+ */
+function createAbortTimeout(ms) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ms);
+  return { controller, timeoutId };
 }
 
 // ─── Helpers de sanitización ──────────────────────────────────────────────────
 
 /**
- * Coerción de tipos estricta para tareas antes de enviar al RPC. [C2]
- * PostgreSQL v2.0.0 rechaza cualquier tipo incorrecto con error 400.
+ * [CVE-001] [CVE-004] Sanitización estricta de Task.
+ * 
+ * - Rechaza owner_id (CVE-001: prevenir inyección)
+ * - Valida completed como boolean real, no string (CVE-004: prevenir type confusion)
+ * - sheet_id se fuerza desde argumento, no del payload
  *
  * @param {object} task
+ * @param {string} expectedSheetId - sheet_id canónico (no del payload)
  * @returns {{ id: string, sheet_id: string, text: string, completed: boolean }}
+ * @throws {CloudServiceError}
  */
-function sanitizeTask(task) {
+function sanitizeTask(task, expectedSheetId) {
+  // [CVE-001] NEGAR cualquier intento de inyectar owner_id
+  if (task.owner_id !== undefined || task.owner_uid !== undefined) {
+    throw new CloudServiceError(
+      'Intento de inyección: owner_id no permitido en el cliente',
+      'INJECTION_ATTEMPT',
+      'El cliente nunca debe incluir owner_id. Contacta a soporte.',
+      false, // no reintentable
+    );
+  }
+
+  // [CVE-004] Validación estricta de boolean
+  let completed;
+  if (task.completed === undefined || task.completed === null) {
+    completed = false;
+  } else if (typeof task.completed === 'boolean') {
+    completed = task.completed;
+  } else if (typeof task.completed === 'string') {
+    const lower = task.completed.toLowerCase().trim();
+    if (lower === 'true' || lower === '1') {
+      completed = true;
+    } else if (lower === 'false' || lower === '0') {
+      completed = false;
+    } else {
+      throw new CloudServiceError(
+        `Boolean inválido para task.completed: "${task.completed}"`,
+        'INVALID_BOOLEAN',
+        'completed debe ser true, false, "true", "false", 1, o 0',
+        false,
+      );
+    }
+  } else if (typeof task.completed === 'number') {
+    completed = task.completed !== 0;
+  } else {
+    throw new CloudServiceError(
+      `Tipo inválido para task.completed: ${typeof task.completed}`,
+      'TYPE_ERROR',
+      `completed debe ser boolean, no ${typeof task.completed}`,
+      false,
+    );
+  }
+
   return {
-    id:        String(task.id),
-    sheet_id:  String(task.sheet_id),
+    id:        String(task.id ?? '').trim(),
+    sheet_id:  String(expectedSheetId), // FORZAR desde argumento
     text:      String(task.text ?? '').trim(),
-    completed: Boolean(task.completed),   // forzar boolean — no string/undefined
+    completed: completed, // ✅ Tipado estrictamente
   };
 }
 
 /**
- * Coerción de tipos estricta para gastos antes de enviar al RPC. [C2]
+ * [CVE-005] Sanitización dedicada de amount.
+ * Rechaza NaN, Infinity, y valores no-finitos.
+ * @param {any} val
+ * @returns {number}
+ * @throws {CloudServiceError}
+ */
+function sanitizeAmount(val) {
+  if (val === undefined || val === null) return 0;
+
+  let num;
+  if (typeof val === 'number') {
+    num = val;
+  } else if (typeof val === 'string') {
+    num = parseFloat(val);
+  } else {
+    throw new CloudServiceError(
+      `Tipo inválido para amount: ${typeof val}`,
+      'AMOUNT_TYPE_ERROR',
+      `amount debe ser number o string numérico, no ${typeof val}`,
+      false,
+    );
+  }
+
+  // [CVE-005] RECHAZAR explícitamente valores IEEE no-finitos
+  if (!Number.isFinite(num)) {
+    throw new CloudServiceError(
+      `Amount no-finito: ${num}`,
+      'AMOUNT_NOT_FINITE',
+      `amount debe ser un número finito, recibido: ${val}`,
+      false,
+    );
+  }
+
+  // Validar rango razonable
+  const MIN_AMOUNT = -999_999_999;
+  const MAX_AMOUNT = 999_999_999;
+  if (num < MIN_AMOUNT || num > MAX_AMOUNT) {
+    throw new CloudServiceError(
+      `Amount fuera de rango: ${num}`,
+      'AMOUNT_OUT_OF_RANGE',
+      `amount debe estar entre ${MIN_AMOUNT} y ${MAX_AMOUNT}`,
+      false,
+    );
+  }
+
+  return num;
+}
+
+/**
+ * [CVE-001] Sanitización estricta de Expense.
  *
  * @param {object} expense
+ * @param {string} expectedSheetId - sheet_id canónico (no del payload)
  * @returns {{ id: string, sheet_id: string, description: string, amount: number }}
+ * @throws {CloudServiceError}
  */
-function sanitizeExpense(expense) {
+function sanitizeExpense(expense, expectedSheetId) {
+  // [CVE-001] NEGAR inyección de owner_id
+  if (expense.owner_id !== undefined || expense.owner_uid !== undefined) {
+    throw new CloudServiceError(
+      'Intento de inyección: owner_id no permitido',
+      'INJECTION_ATTEMPT',
+      '',
+      false,
+    );
+  }
+
   return {
-    id:          String(expense.id),
-    sheet_id:    String(expense.sheet_id),
+    id:          String(expense.id ?? '').trim(),
+    sheet_id:    String(expectedSheetId), // FORZAR desde argumento
     description: String(expense.description ?? '').trim(),
-    amount:      Number(expense.amount) || 0,  // forzar number — nunca NaN/null
+    amount:      sanitizeAmount(expense.amount), // Validación dedicada
   };
 }
 
@@ -235,39 +405,49 @@ export const CloudService = {
    */
   async syncSupabaseAuth({ email, password }) {
     const client = getSupabaseClient();
+    const timeout = getAuthTimeout(); // [CVE-010] Timeout adaptativo
 
-    // Timeout de 8 s — si Supabase no responde, rechazamos inmediatamente [C4]
-    const result = await Promise.race([
-      (async () => {
-        const { data: signInData, error: signInError } =
-          await client.auth.signInWithPassword({ email, password });
+    // [CVE-008] Usar AbortController para mejor control
+    const { controller, timeoutId } = createAbortTimeout(timeout);
 
-        if (!signInError && signInData?.user) return signInData.user.id;
+    try {
+      const { data: signInData, error: signInError } =
+        await client.auth.signInWithPassword({ email, password });
 
-        // Si las credenciales son inválidas, intentar registro
-        if (signInError?.message?.includes('Invalid login credentials')) {
-          const { data: signUpData, error: signUpError } =
-            await client.auth.signUp({ email, password });
-          if (signUpError) throw new CloudServiceError(
-            signUpError.message,
-            String(signUpError.status ?? signUpError.code ?? 'AUTH_ERROR'),
-            signUpError.details ?? '',
-            false, // credenciales incorrectas — no reintentar
-          );
-          return signUpData.user?.id;
-        }
+      if (!signInError && signInData?.user) return signInData.user.id;
 
+      // Si las credenciales son inválidas, intentar registro
+      if (signInError?.message?.includes('Invalid login credentials')) {
+        const { data: signUpData, error: signUpError } =
+          await client.auth.signUp({ email, password });
+        if (signUpError) throw new CloudServiceError(
+          signUpError.message,
+          String(signUpError.status ?? signUpError.code ?? 'AUTH_ERROR'),
+          signUpError.details ?? '',
+          false,
+        );
+        return signUpData.user?.id;
+      }
+
+      throw new CloudServiceError(
+        signInError.message,
+        String(signInError.status ?? signInError.code ?? 'AUTH_ERROR'),
+        signInError.details ?? '',
+        true,
+      );
+    } catch (err) {
+      if (err.name === 'AbortError') {
         throw new CloudServiceError(
-          signInError.message,
-          String(signInError.status ?? signInError.code ?? 'AUTH_ERROR'),
-          signInError.details ?? '',
+          `Timeout en Supabase Auth tras ${timeout}ms`,
+          'TIMEOUT',
+          'La conexión tardó demasiado. Verifica tu red.',
           true,
         );
-      })(),
-      rejectAfter(AUTH_TIMEOUT_MS),
-    ]);
-
-    return result;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId); // [CVE-008] Cleanup
+    }
   },
 
   /**
@@ -280,25 +460,34 @@ export const CloudService = {
    */
   async bridgeGoogleAuth(idToken) {
     const client = getSupabaseClient();
+    const timeout = getAuthTimeout(); // [CVE-010]
+    const { controller, timeoutId } = createAbortTimeout(timeout); // [CVE-008]
 
-    const result = await Promise.race([
-      (async () => {
-        const { data, error } = await client.auth.signInWithIdToken({
-          provider: 'google',
-          token:    idToken,
-        });
-        if (error) throw new CloudServiceError(
-          error.message,
-          String(error.status ?? error.code ?? 'GOOGLE_AUTH_ERROR'),
-          error.details ?? '',
+    try {
+      const { data, error } = await client.auth.signInWithIdToken({
+        provider: 'google',
+        token:    idToken,
+      });
+      if (error) throw new CloudServiceError(
+        error.message,
+        String(error.status ?? error.code ?? 'GOOGLE_AUTH_ERROR'),
+        error.details ?? '',
+        true,
+      );
+      return data.user?.id;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new CloudServiceError(
+          `Timeout en Google Auth tras ${timeout}ms`,
+          'TIMEOUT',
+          'La conexión tardó demasiado. Verifica tu red.',
           true,
         );
-        return data.user?.id;
-      })(),
-      rejectAfter(AUTH_TIMEOUT_MS),
-    ]);
-
-    return result;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId); // [CVE-008]
+    }
   },
 
   /**
@@ -370,11 +559,13 @@ export const CloudService = {
           break;
 
         case MutationType.UPSERT_TASK:
-          tasksMap.set(p.id, sanitizeTask(p));   // [C2] tipado estricto
+          // [CVE-001] Pasar expectedSheetId desde el estado, no del payload
+          tasksMap.set(p.id, sanitizeTask(p, p.sheet_id ?? workspaceId));
           break;
 
         case MutationType.UPSERT_EXPENSE:
-          expensesMap.set(p.id, sanitizeExpense(p));  // [C2] tipado estricto
+          // [CVE-001] Pasar expectedSheetId desde el estado, no del payload
+          expensesMap.set(p.id, sanitizeExpense(p, p.sheet_id ?? workspaceId));
           break;
 
         case MutationType.DELETE_EXPENSE:

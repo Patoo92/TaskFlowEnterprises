@@ -295,19 +295,47 @@ export function WorkspaceProvider({ children }) {
     async function init() {
       dispatch({ type: 'LOADING' });
       try {
-        // [A1/A2] workspaceId y workspaceName se leen aquí y viven en el estado
-        const wsView = await WorkspaceService.ensureDefault(user.uid);
-        const meta   = await SyncMetaService.get(user.uid);
-
-        dispatch({
-          type:    'INIT_SUCCESS',
-          payload: {
-            workspaceId:   wsView.id,        // [A1] UUID del workspace
-            workspaceName: wsView.name,      // [A2] nombre del workspace
-            sheets:        wsView.sheets,
-            lastSyncedAt:  meta?.lastSyncedAt ?? null,
-          },
-        });
+        // [CVE-007] Obtener workspace_id CANÓNICO primero
+        const canonicalWorkspaceId = await SyncMetaService.getOrCreateCanonicalWorkspaceId(user.uid);
+        
+        // Luego, cargar o crear el workspace con ese ID
+        const wsView = await WorkspaceService.ensureDefault(user.uid, canonicalWorkspaceId);
+        
+        // [CVE-007] Validar que no haya conflicto (ej. si otro device creó uno diferente)
+        if (wsView.id !== canonicalWorkspaceId) {
+          console.error('[WorkspaceContext] WORKSPACE CONFLICT DETECTED', {
+            canonical: canonicalWorkspaceId,
+            actual: wsView.id,
+          });
+          
+          // Registrar conflicto y USAR el canonical (no el remoto)
+          await SyncMetaService.recordWorkspaceConflict(user.uid, canonicalWorkspaceId, wsView.id);
+          
+          // Rechazar el conflicto: usar canonical, descartar remoto
+          const correctedWsView = await WorkspaceService.ensureDefault(user.uid, canonicalWorkspaceId);
+          
+          dispatch({
+            type: 'INIT_SUCCESS',
+            payload: {
+              workspaceId:   correctedWsView.id,
+              workspaceName: correctedWsView.name,
+              sheets:        correctedWsView.sheets,
+              lastSyncedAt:  null,
+              conflictDetected: true,
+            },
+          });
+        } else {
+          const meta = await SyncMetaService.get(user.uid);
+          dispatch({
+            type: 'INIT_SUCCESS',
+            payload: {
+              workspaceId:   wsView.id,
+              workspaceName: wsView.name,
+              sheets:        wsView.sheets,
+              lastSyncedAt:  meta?.lastSyncedAt ?? null,
+            },
+          });
+        }
 
         // Drenar outbox residual de sesiones anteriores (mutaciones offline)
         const pending = await OutboxService.count();
@@ -328,7 +356,8 @@ export function WorkspaceProvider({ children }) {
   // ─── drainOutbox — Motor de Sincronización ───────────────────────────────────
 
   /**
-   * Envía todas las mutaciones pendientes del outbox a Supabase.
+   * [CVE-002] Envía todas las mutaciones pendientes del outbox a Supabase.
+   * Arreglado: try-catch anidados para evitar deadlock en syncInProgressRef.
    *
    * Garantías v2.0.0:
    *  [M1] syncInProgressRef = mutex — nunca dos drains concurrentes.
@@ -357,22 +386,32 @@ export function WorkspaceProvider({ children }) {
       return;
     }
 
-    const mutations = await OutboxService.getAll();
-    if (!mutations.length) return;
-
-    // Adquirir el lock
     syncInProgressRef.current = true;
-    dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
-
+    
+    // ✅ [CVE-002] ARREGLO: envolver en try-finally ANTES de cualquier await
     try {
-      // Separar entradas válidas de irrecuperables
-      const valid   = mutations.filter((m) => (m.retries ?? 0) < MAX_OUTBOX_RETRIES);
+      dispatch({ type: 'SYNC_STATUS', payload: { status: 'syncing' } });
+
+      const mutations = await OutboxService.getAll();
+      if (!mutations.length) {
+        const nowIso = new Date().toISOString();
+        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
+        dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
+        return;
+      }
+
+      const valid = mutations.filter((m) => (m.retries ?? 0) < MAX_OUTBOX_RETRIES);
       const invalid = mutations.filter((m) => (m.retries ?? 0) >= MAX_OUTBOX_RETRIES);
 
-      // Descartar entradas que agotaron reintentos
+      // ✅ Limpiar irrecuperables CON captura de error
       for (const m of invalid) {
-        console.warn('[WorkspaceContext] Descartando mutación con max reintentos:', m.idb_id, m.type);
-        await OutboxService.remove(m.idb_id);
+        try {
+          console.warn('[WorkspaceContext] Descartando mutación:', m.idb_id);
+          await OutboxService.remove(m.idb_id);
+        } catch (err) {
+          // Log pero no propagar — no sabemos por qué falló IDB remove
+          console.error('[WorkspaceContext] Failed to remove invalid mutation:', err);
+        }
       }
 
       if (!valid.length) {
@@ -382,60 +421,107 @@ export function WorkspaceProvider({ children }) {
         return;
       }
 
-      // [C1] Llamada al RPC con workspaceId y workspaceName explícitos
-      // cloudService.processOutboxBatch incluye withRetry internamente — [CLEAN]
       const result = await CloudService.processOutboxBatch(
         valid,
         workspaceId,    // [A1] del estado — no derivado del batch
         workspaceName,  // [A2] del estado
       );
 
+      // ✅ ARREGLO: separar lógica de remove con try-catch independiente
       if (result.success) {
-        // Confirmar: eliminar entradas del outbox
-        for (const m of valid) await OutboxService.remove(m.idb_id);
+        const removalErrors = [];
+        for (const m of valid) {
+          try {
+            await OutboxService.remove(m.idb_id);
+          } catch (err) {
+            removalErrors.push({ id: m.idb_id, error: err.message });
+            console.error('[WorkspaceContext] Failed to remove synced mutation:', err);
+          }
+        }
 
-        // Purgar tombstones de IDB confirmados por Supabase
-        const deletedTaskIds = valid
-          .filter((m) => m.type === MutationType.DELETE_TASK)
-          .map((m) => m.payload.id);
-        const deletedExpenseIds = valid
-          .filter((m) => m.type === MutationType.DELETE_EXPENSE)
-          .map((m) => m.payload.id);
+        if (removalErrors.length > 0) {
+          // No es un fallo crítico — lanzar aviso pero continuar
+          console.warn('[WorkspaceContext] Partial removal failure:', removalErrors);
+          dispatch({
+            type: 'SYNC_STATUS',
+            payload: {
+              status: 'error',
+              error: `Sync éxitoso pero ${removalErrors.length} mutaciones no se limpiaron. Reintentar.`,
+            },
+          });
+          // Incrementar retries para reintento completo
+          for (const m of valid) {
+            try {
+              await OutboxService.incrementRetry(m.idb_id);
+            } catch (e) { /* ignored */ }
+          }
+        } else {
+          // Limpieza exitosa
+          const deletedTaskIds = valid
+            .filter((m) => m.type === MutationType.DELETE_TASK)
+            .map((m) => m.payload.id);
+          const deletedExpenseIds = valid
+            .filter((m) => m.type === MutationType.DELETE_EXPENSE)
+            .map((m) => m.payload.id);
 
-        if (deletedTaskIds.length)    await TaskService.purgeTombstones(deletedTaskIds);
-        if (deletedExpenseIds.length) await ExpenseService.purgeTombstones(deletedExpenseIds);
+          if (deletedTaskIds.length) {
+            try {
+              await TaskService.purgeTombstones(deletedTaskIds);
+            } catch (err) {
+              console.warn('[WorkspaceContext] Tombstone purge failed (non-fatal):', err);
+            }
+          }
+          if (deletedExpenseIds.length) {
+            try {
+              await ExpenseService.purgeTombstones(deletedExpenseIds);
+            } catch (err) {
+              console.warn('[WorkspaceContext] Tombstone purge failed (non-fatal):', err);
+            }
+          }
 
-        // Actualizar metadatos de sync
-        const nowIso = new Date().toISOString();
-        await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
-        dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
-
+          const nowIso = new Date().toISOString();
+          await SyncMetaService.upsert(currentUser.uid, { lastSyncedAt: nowIso });
+          dispatch({ type: 'SET_LAST_SYNCED', payload: nowIso });
+        }
       } else {
-        // [CLEAN] Sin retry manual — cloudService ya gestionó withRetry.
-        // Incrementamos retries en outbox para el siguiente ciclo de drain.
-        for (const m of valid) await OutboxService.incrementRetry(m.idb_id);
+        for (const m of valid) {
+          try {
+            await OutboxService.incrementRetry(m.idb_id);
+          } catch (err) {
+            console.error('[WorkspaceContext] Failed to increment retry:', err);
+          }
+        }
         dispatch({
-          type:    'SYNC_STATUS',
+          type: 'SYNC_STATUS',
           payload: { status: 'error', error: result.error ?? 'Error desconocido' },
         });
       }
 
     } catch (err) {
-      // Error no controlado (ej. red caída antes de que withRetry lo capture)
-      console.error('[WorkspaceContext] drainOutbox error inesperado:', err.message);
-      // Incrementar retries del batch completo
-      const currentMutations = await OutboxService.getAll();
-      for (const m of currentMutations) await OutboxService.incrementRetry(m.idb_id);
+      console.error('[WorkspaceContext] drainOutbox exception:', err);
+      try {
+        const currentMutations = await OutboxService.getAll();
+        for (const m of currentMutations) {
+          try {
+            await OutboxService.incrementRetry(m.idb_id);
+          } catch (e) { /* ignored */ }
+        }
+      } catch (e) {
+        console.error('[WorkspaceContext] Failed to increment retries on exception:', e);
+      }
       dispatch({
-        type:    'SYNC_STATUS',
+        type: 'SYNC_STATUS',
         payload: { status: 'error', error: err.message },
       });
     } finally {
-      // Liberar el lock siempre, incluso si hubo excepción — [M1]
+      // ✅ Siempre liberar el lock, incluso con excepciones anidadas
       syncInProgressRef.current = false;
-      // Actualizar badge de pendientes en NavBar
-      const remaining = await OutboxService.count();
-      dispatch({ type: 'SET_PENDING_MUTATIONS', payload: remaining });
+      try {
+        const remaining = await OutboxService.count();
+        dispatch({ type: 'SET_PENDING_MUTATIONS', payload: remaining });
+      } catch (err) {
+        console.warn('[WorkspaceContext] Failed to update pending count:', err);
+      }
     }
   }, []); // stable — lee estado via refs, no cierra sobre state
 
