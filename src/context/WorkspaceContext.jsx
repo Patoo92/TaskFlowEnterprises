@@ -77,7 +77,6 @@ import {
   OutboxService,
   SyncMetaService,
   MutationType,
-  MAX_OUTBOX_RETRIES as DB_MAX_RETRIES,
 } from '../services/db';
 import {
   CloudService,

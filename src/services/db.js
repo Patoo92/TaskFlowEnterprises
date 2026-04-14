@@ -551,7 +551,7 @@ export const WorkspaceService = {
    * @param {string} ownerUid - UID local del usuario
    * @returns {Promise<WorkspaceView>}
    */
-  async ensureDefault(ownerUid) {
+  async ensureDefault(ownerUid, canonicalWorkspaceId = null) {
     const db = await dbPromise;
 
     // ── Buscar workspace existente ────────────────────────────────────────────
@@ -559,11 +559,21 @@ export const WorkspaceService = {
     // Buscamos con ambos índices disponibles.
     let existingWs = null;
 
-    try {
-      // Intentar con índice by_ownerId (v1.5)
-      const byOwner = await db.getAllFromIndex('workspaces', 'by_ownerId', ownerUid);
-      if (byOwner.length > 0) existingWs = byOwner[0];
-    } catch (_e) { /* índice no existe */ }
+    // [CVE-007] Si hay canonicalWorkspaceId, búscalo primero
+    if (canonicalWorkspaceId) {
+      try {
+        existingWs = await db.get('workspaces', canonicalWorkspaceId);
+      } catch (_e) { /* no existe */ }
+    }
+
+    // Si no existe el canonical, buscar por owner
+    if (!existingWs) {
+      try {
+        // Intentar con índice by_ownerId (v1.5)
+        const byOwner = await db.getAllFromIndex('workspaces', 'by_ownerId', ownerUid);
+        if (byOwner.length > 0) existingWs = byOwner[0];
+      } catch (_e) { /* índice no existe */ }
+    }
 
     if (!existingWs) {
       try {
@@ -627,12 +637,14 @@ export const WorkspaceService = {
     }
 
     // ── Crear workspace + sheet inicial ──────────────────────────────────────
-    const wsId      = generateUUID();
+    // [CVE-007] Usar canonicalWorkspaceId si se proporciona; de lo contrario, generar uno
+    const wsId      = canonicalWorkspaceId ?? generateUUID();
     const sheetId   = generateUUID();
     const timestamp = now();
 
     const workspace = {
-      id:         wsId,        // UUID sync (keyPath)
+      uid:        wsId,        // IDB keyPath (required)
+      id:         wsId,        // UUID sync también como id
       owner_uid:  ownerUid,    // v6 campo limpio
       ownerId:    ownerUid,    // retrocompatibilidad índice v1.5
       owner_id:   ownerUid,    // retrocompatibilidad
